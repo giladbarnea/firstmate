@@ -198,6 +198,29 @@ tests/fm-claude-stop-autoarm.test.sh
 tests/fm-turnend-guard.test.sh
 ```
 
+## PR-ready silence
+
+The authenticated PR-wait boundary was verified on 2026-08-01 through the normal watcher, away-mode daemon, and forge poll entry points.
+The classifier required a finished `yolo=off` ship, no open keyed captain decision or PR event, and the complete metadata-bound static poll before suppressing any endpoint signal.
+
+```sh
+bin/fm-test-run.sh tests/fm-watch-triage.test.sh
+bin/fm-test-run.sh tests/fm-daemon.test.sh
+bin/fm-test-run.sh tests/fm-pr-check-security.test.sh
+```
+
+Observed bounded output:
+
+```text
+ok - authenticated PR-wait classification is backend-neutral and yields to decisions, blockers, failures, and poll corruption
+ok - an authenticated PR wait absorbs signal, stale, busy-age, heartbeat, and no-change churn without touching unlanded work
+ok - away-mode signal, stale, housekeeping, and heartbeat paths stay silent only for an authenticated PR wait
+ok - PR monitoring surfaces state transitions once, keeps non-merged work armed, and retires only an exact merge
+```
+
+The watcher regression also preserves byte hashes for task metadata and all three poll artifacts plus an isolated-copy sentinel.
+The forge regression keeps non-merged PR state armed, deduplicates an unchanged close, conflict, or failed-check result, resets that observation after green, and retains merge-only retirement.
+
 ## Wedge-alarm channels
 
 The two real notification channels were bounded manually on 2026-07-10 on macOS 26.5.2 with Herdr 0.7.3.

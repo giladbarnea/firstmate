@@ -343,12 +343,13 @@ classify_signal() {  # <reason-after-colon> <state>
     [ -n "$last" ] || continue
     distilled="${distilled}$(basename "$f"): ${last} | "
     status_is_captain_relevant "$last" || continue
+    task=$(basename "$f"); task="${task%.status}"
+    task_is_waiting_for_captain_merge "$state" "$task" && continue
     rel=1
     # Dedupe against the catch-all scan: if this status was already escalated
     # (seen marker matches), skip escalating again. The seen marker is the
     # single source of truth shared between the per-wake signal path and the
     # heartbeat scan. all_seen stays 1 only if EVERY relevant file was seen.
-    task=$(basename "$f"); task="${task%.status}"
     seen="$state/.subsuper-seen-status-$(_stale_key "$task")"
     [ "$(cat "$seen" 2>/dev/null || true)" = "$last" ] || all_seen=0
   done
@@ -372,6 +373,10 @@ classify_stale() {  # <window> <state>
   local win=$1 state=$2 task last seen
   task=$(window_to_task "$win" "$state")
   last=$(last_status_line "$state/$task.status")
+  if task_is_waiting_for_captain_merge "$state" "$task"; then
+    printf 'silent|authenticated PR wait: %s' "$last"
+    return
+  fi
   if [ -n "$last" ] && status_is_paused "$last"; then
     # A DECLARED external-wait pause (fm-classify-lib.sh): an idle pane is EXPECTED,
     # so this is not a wedge. The caller records a pause marker (long re-surface
@@ -1004,6 +1009,10 @@ housekeeping() {  # <state>
     fi
     task=$(window_to_task "$win" "$state")
     last=$(last_status_line "$state/$task.status")
+    if task_is_waiting_for_captain_merge "$state" "$task"; then
+      clear_pause_tracking "$win" "$state"
+      continue
+    fi
     if [ -n "$last" ] && status_is_paused "$last"; then
       reconcile_pause_tracking "$win" "$state" "$last"
       continue
@@ -1232,6 +1241,10 @@ handle_wake() {  # <reason> <state>
       [ "$kind" = "stale" ] && stale_marker_remove "$arg" "$state"
       mark_escalated_seen "$kind" "$arg" "$state"
       [ "${FM_ESCALATE_BATCH_SECS:-$ESCALATE_BATCH_SECS_DEFAULT}" -le 0 ] && { escalate_flush "$state" || true; }
+      ;;
+    silent)
+      [ "$kind" = stale ] && clear_pause_tracking "$arg" "$state"
+      log "self-handle (authenticated PR wait): $reason -> $distilled"
       ;;
     pause)
       # Declared external-wait pause: record a pause marker (long re-surface

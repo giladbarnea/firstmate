@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Shared wake classifier: the common source of truth for captain-relevant status
-# tests, declared-external-wait vocabulary, and the working/paused absorb
-# classification that makes no-verb signal and stale-pane wakes safe to absorb.
+# tests, authenticated PR-wait silence, declared-external-wait vocabulary, and
+# the working/paused classification for no-verb signals and stale panes.
 # Sourced by BOTH the always-on watcher
 # (bin/fm-watch.sh) and the away-mode daemon (bin/fm-supervise-daemon.sh) so the
 # overlapping triage policy lives in one place instead of two copies that can
@@ -25,6 +25,11 @@
 # Resolved at source time from BASH_SOURCE so it works whether sourced by a
 # bin/ script (which sets its own SCRIPT_DIR) or directly by a test.
 _FM_CLASSIFY_LIB_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd 2>/dev/null)" || _FM_CLASSIFY_LIB_DIR="."
+
+# Authenticated PR-poll provenance is part of the shared classification proof.
+# shellcheck source=bin/fm-pr-lib.sh
+. "$_FM_CLASSIFY_LIB_DIR/fm-pr-lib.sh"
+FM_CLASSIFY_PR_POLL_TEMPLATE="${FM_CLASSIFY_PR_POLL_TEMPLATE:-$_FM_CLASSIFY_LIB_DIR/fm-pr-poll.sh}"
 
 # The crew current-state reader used for the "provably working" decision.
 # Overridable so tests can stub the run-step/pane verdict without a real worktree
@@ -278,6 +283,27 @@ status_open_activities() {  # <status-file-or-dash>
   _fm_status_open_activities_stream < "$f"
 }
 
+# A PR-ready ship is no longer endpoint-supervised work. It waits silently only
+# while its latest event is done, no keyed captain decision or PR event remains
+# open, yolo is off, and the metadata and static PR poll pass provenance checks.
+task_is_waiting_for_captain_merge() {  # <state> <task-id>
+  local state=$1 id=$2 status meta last kind yolo
+  fm_pr_task_id_valid "$id" || return 1
+  status="$state/$id.status"
+  meta="$state/$id.meta"
+  [ -f "$status" ] && [ ! -L "$status" ] || return 1
+  last=$(last_status_line "$status")
+  [ "$(status_line_verb "$last")" = "done" ] || return 1
+  [ -z "$(status_open_decisions "$status")" ] || return 1
+  kind=$(grep '^kind=' "$meta" 2>/dev/null | tail -1 | cut -d= -f2- || true)
+  [ -n "$kind" ] || kind=ship
+  [ "$kind" = ship ] || return 1
+  yolo=$(grep '^yolo=' "$meta" 2>/dev/null | tail -1 | cut -d= -f2- || true)
+  [ "$yolo" = off ] || return 1
+  [ ! -e "$state/.pr-poll-seen-$id" ] && [ ! -L "$state/.pr-poll-seen-$id" ] || return 1
+  fm_pr_poll_artifacts_valid "$state" "$id" "$FM_CLASSIFY_PR_POLL_TEMPLATE"
+}
+
 # task id from a recorded window target, falling back to the tmux-shaped
 # "<session>:fm-<id>" form when no metadata state is available.
 window_to_task() {
@@ -304,12 +330,15 @@ window_to_task() {
 # no-verb signal (a bare turn-end, a working: note) is only benign when the crew is
 # also provably working (signal_crew_provably_working below); otherwise it surfaces.
 signal_reason_is_actionable() {  # <file> ...
-  local f last
+  local f last task state
   for f in "$@"; do
     [ -e "$f" ] || continue
     case "$f" in *.status) ;; *) continue ;; esac
     last=$(last_status_line "$f")
     [ -n "$last" ] || continue
+    task=$(basename "$f"); task=${task%.status}
+    state=${f%/*}
+    task_is_waiting_for_captain_merge "$state" "$task" && continue
     status_is_captain_relevant "$last" && return 0
   done
   return 1
@@ -386,6 +415,27 @@ signal_crew_provably_working() {  # <file> ...
   return 0
 }
 
+# 0 only when every task in a coalesced signal is an authenticated PR wait.
+# This exemption applies before away-mode one-shot handling, so finished worker
+# signals stop at the shared classifier instead of waking either supervisor.
+signal_crews_waiting_for_captain_merge() {  # <file> ...
+  local f base task state seen=""
+  for f in "$@"; do
+    base=${f##*/}
+    case "$base" in
+      *.status) task=${base%.status} ;;
+      *.turn-ended) task=${base%.turn-ended} ;;
+      *) continue ;;
+    esac
+    [ -n "$task" ] || continue
+    case " $seen " in *" $task "*) continue ;; esac
+    seen="$seen $task"
+    state=${f%/*}
+    task_is_waiting_for_captain_merge "$state" "$task" || return 1
+  done
+  [ -n "$seen" ]
+}
+
 # 0 (terminal/actionable) if a stale window's last status line is
 # captain-relevant; 1 otherwise, including the no-status case. A 1 only means
 # "non-terminal"; the always-on watcher then applies crew_is_provably_working,
@@ -408,6 +458,7 @@ scan_captain_relevant_statuses() {  # <state>
     last=$(last_status_line "$f")
     status_is_captain_relevant "$last" || continue
     task=$(basename "$f"); task="${task%.status}"
+    task_is_waiting_for_captain_merge "$state" "$task" && continue
     printf '%s\t%s\t%s\n' "$f" "$task" "$last"
   done
   return 0

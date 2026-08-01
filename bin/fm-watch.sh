@@ -6,9 +6,10 @@
 # is absorbed only when the crew shows POSITIVE evidence it is still working (an
 # actively-running no-mistakes step, or a backend busy signal), and surfaced
 # otherwise, so a crew that finishes (or stops and waits) without a current
-# working signal is never silently swallowed. A declared external-wait pause is
-# the separate idle absorb case and re-surfaces only on its long bounded cadence,
-# although its initial no-verb status signal still surfaces in normal mode.
+# working signal is never silently swallowed. An authenticated PR-ready ship is
+# the deliberate terminal exception: its endpoint becomes silent while the PR
+# poll remains armed. A declared external-wait pause is the separate idle absorb
+# case and re-surfaces only on its long bounded cadence.
 # While state/.afk exists, the daemon owns triage and this watcher queues and exits
 # on every wake. Printed reason lines:
 #   signal: <file>...      status/turn-end signals, surfaced when a listed status
@@ -454,6 +455,32 @@ scan_signals() {
   return 0
 }
 
+pr_poll_seen_path() { printf '%s/.pr-poll-seen-%s' "$STATE" "$1"; }
+
+pr_poll_seen_matches() {  # <task-id> <result>
+  local id=$1 result=$2 path
+  path=$(pr_poll_seen_path "$id")
+  [ -f "$path" ] && [ ! -L "$path" ] || return 1
+  [ "$(fm_pr_file_link_count "$path")" = 1 ] || return 1
+  [ "$(cat "$path" 2>/dev/null || true)" = "${FM_PR_POLL_SNAPSHOT_URL}"$'\t'"$result" ]
+}
+
+pr_poll_seen_record() {  # <task-id> <result>
+  local id=$1 result=$2 path tmp
+  path=$(pr_poll_seen_path "$id")
+  [ ! -d "$path" ] || return 1
+  tmp=$(mktemp "$STATE/.fm-pr-poll-seen.XXXXXX") || return 1
+  if ! printf '%s\t%s\n' "$FM_PR_POLL_SNAPSHOT_URL" "$result" > "$tmp" \
+    || ! chmod 0600 "$tmp" \
+    || ! mv -f -- "$tmp" "$path"; then
+    rm -f -- "$tmp"
+    return 1
+  fi
+  [ -f "$path" ] && [ ! -L "$path" ] && [ "$(fm_pr_file_link_count "$path")" = 1 ]
+}
+
+pr_poll_seen_clear() { rm -f -- "$(pr_poll_seen_path "$1")"; }
+
 run_check_process() {
   local c=$1
   shift
@@ -771,20 +798,40 @@ while :; do
           continue
         fi
       fi
-      if [ -n "$out" ]; then
-        reason="check: $c: $out"
-        fm_wake_append check "$c" "$reason" || exit 1
-        if [ "$is_pr_poll" -eq 1 ] && [ "$out" = merged ]; then
+      if [ -z "$out" ]; then
+        [ "$is_pr_poll" -eq 0 ] || pr_poll_seen_clear "$id" \
+          || triage_log "could not clear the PR observation marker for $id"
+        continue
+      fi
+      if [ "$is_pr_poll" -eq 1 ] \
+        && ! fm_pr_poll_snapshot_matches "$STATE" "$id" "$SCRIPT_DIR/fm-pr-poll.sh"; then
+        triage_log "ignored a PR result whose authenticated snapshot changed for $id"
+        continue
+      fi
+      case "$is_pr_poll:$out" in
+        1:closed|1:conflict|1:checks-failed)
+          pr_poll_seen_matches "$id" "$out" && continue
+          ;;
+      esac
+      reason="check: $c: $out"
+      fm_wake_append check "$c" "$reason" || exit 1
+      case "$is_pr_poll:$out" in
+        1:merged)
           if fm_pr_poll_retirement_publish "$STATE" "$id" "$SCRIPT_DIR/fm-pr-poll.sh" "$out"; then
             fm_pr_poll_retirement_recover_one "$STATE" "$id" "$SCRIPT_DIR/fm-pr-poll.sh" \
               || triage_log "merged PR poll retirement remains recoverable for $id"
           else
             triage_log "merged PR poll retirement deferred because its canonical snapshot changed for $id"
           fi
-        fi
-        touch "$STATE/.last-check"
-        wake "$reason"
-      fi
+          pr_poll_seen_clear "$id" || triage_log "could not clear the merged PR observation marker for $id"
+          ;;
+        1:closed|1:conflict|1:checks-failed)
+          pr_poll_seen_record "$id" "$out" \
+            || triage_log "could not record the PR observation marker for $id"
+          ;;
+      esac
+      touch "$STATE/.last-check"
+      wake "$reason"
     done
     if [ -n "$rejected_checks" ]; then
       reason="check: rejected unauthenticated state checks:$rejected_checks"
@@ -825,8 +872,16 @@ EOF
     # will not re-fire, log, and keep blocking without enqueuing. The provably-working
     # check is the only costly one (it may run a bounded no-mistakes call), so the ||
     # ordering evaluates it ONLY for a non-afk, no-captain-verb signal.
+    # A completed ship with an authenticated PR poll is silent before the AFK
+    # one-shot handoff. Every other signal retains the existing action test.
+    signal_actionable=0
     # shellcheck disable=SC2086  # $files is a space-separated status-path list (ids carry no spaces)
-    if afk_present || signal_reason_is_actionable $files || ! signal_crew_provably_working $files; then
+    if signal_crews_waiting_for_captain_merge $files; then
+      signal_actionable=0
+    elif afk_present || signal_reason_is_actionable $files || ! signal_crew_provably_working $files; then
+      signal_actionable=1
+    fi
+    if [ "$signal_actionable" -eq 1 ]; then
       while IFS=$(printf '\t') read -r sf sig f; do
         [ -n "$sf" ] || continue
         fm_wake_append signal "$(basename "$f")" "$reason" || exit 1
@@ -865,6 +920,10 @@ EOF
     last=$(last_status_line "$STATE/$task.status")
     if ! status_is_paused_or_captain_held "$last" && [ -e "$STATE/.paused-$key" ]; then
       clear_pause_tracking "$w"
+    fi
+    if task_is_waiting_for_captain_merge "$STATE" "$task"; then
+      clear_pause_tracking "$w"
+      continue
     fi
     if [ "$kind" = secondmate ] && ! status_is_paused "$last"; then
       continue

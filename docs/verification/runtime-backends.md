@@ -117,6 +117,33 @@ Valid cleanup removed only the exact task-bound target and left the control wind
 The metadata-only validation covers tmux, Herdr, Zellij, Orca, and cmux before backend dispatch.
 Claude, Codex, OpenCode, Pi, pi-signed, Grok, and Kimi share that backend cleanup boundary; their harness-specific hook files and token cleanup run only after it, so no harness needs a separate endpoint parser.
 
+## Shared PR-ready supervision
+
+The finished `yolo=off` worker exemption was reviewed across every supported task backend on 2026-08-01.
+`bin/fm-watch.sh` applies the shared authenticated predicate before `fm_backend_capture`, so the exemption does not depend on adapter capture output or liveness vocabulary.
+Herdr's native blocked transition remains outside that exemption and stays actionable.
+
+| Backend | Recorded endpoint shape in the classifier matrix | Result |
+| --- | --- | --- |
+| tmux | `window=test:fm-ready` | Silent authenticated PR wait before capture. |
+| Herdr | `window=default:w1:p2` | Silent authenticated PR wait before capture; native blocked events remain active. |
+| Zellij | `window=firstmate:42` | Silent authenticated PR wait before capture. |
+| Orca | `window=term-ready`, `terminal=term-ready` | Silent authenticated PR wait before terminal capture. |
+| cmux | `window=workspace-ready:surface-ready` | Silent authenticated PR wait before capture. |
+
+```sh
+bin/fm-test-run.sh tests/fm-watch-triage.test.sh
+bin/fm-test-run.sh tests/fm-backend.test.sh
+```
+
+Observed bounded output:
+
+```text
+ok - authenticated PR-wait classification is backend-neutral and yields to decisions, blockers, failures, and poll corruption
+ok - an authenticated PR wait absorbs signal, stale, busy-age, heartbeat, and no-change churn without touching unlanded work
+ok - fm_backend_validate_spawn: all implemented lifecycle backends are spawn-supported
+```
+
 ## Herdr
 
 The compatibility floor is protocol 14.
