@@ -225,6 +225,7 @@ The review found that empty poll output had combined verified green, unresolved,
 Separate PR-event and monitoring-error records were necessary because a monitoring error must not erase an earlier conflict.
 The signal fix classifies each task in a coalesced batch, while the all-merge-wait check remains before away-mode handling.
 The forge regression keeps non-merged PR state armed and deduplicates unchanged unresolved states, lifecycle events, credential needs, and lookup failures.
+The GitHub preflight checks only the active account, so stale inactive credentials cannot block a healthy monitor.
 Monitoring errors leave the last PR event intact, verified green clears both records, and only merge retires the poll.
 
 ## Wedge-alarm channels

@@ -63,7 +63,7 @@ case "$provider" in
     esac
     [ "$url" = "https://github.com/$owner/$repo/pull/$number" ] || exit 0
     command -v gh >/dev/null 2>&1 || { printf '%s\n' lookup-error; exit 0; }
-    gh auth status --hostname "$host" >/dev/null 2>&1 \
+    gh auth status --active --hostname "$host" >/dev/null 2>&1 \
       || { printf '%s\n' credentials-needed; exit 0; }
     # shellcheck disable=SC2016  # The jq program expands its own $value variable.
     result=$(gh pr view "$url" --json state,mergeable,mergeStateStatus,statusCheckRollup --jq '
