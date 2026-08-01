@@ -445,11 +445,11 @@ test_signal_crews_safe_to_absorb_classifier() {
 
 test_recovery_instructions_preserve_authenticated_pr_waits() {
   local skill="$ROOT/.agents/skills/stuck-crewmate-recovery/SKILL.md"
-  rg -F "unless AGENTS.md section 7's authenticated PR-wait state applies" "$skill" >/dev/null \
+  grep -F "unless AGENTS.md section 7's authenticated PR-wait state applies" "$skill" >/dev/null \
     || fail "the recovery skill trigger omitted the authenticated PR-wait exception"
-  rg -F "stop this playbook without inspecting or recovering the finished worker endpoint" "$skill" >/dev/null \
+  grep -F "stop this playbook without inspecting or recovering the finished worker endpoint" "$skill" >/dev/null \
     || fail "the recovery skill body omitted the authenticated PR-wait stop rule"
-  rg -F "unless section 7's authenticated PR-wait state applies" "$ROOT/AGENTS.md" >/dev/null \
+  grep -F "unless section 7's authenticated PR-wait state applies" "$ROOT/AGENTS.md" >/dev/null \
     || fail "the skill catalog omitted the authenticated PR-wait exception"
   pass "recovery instructions preserve authenticated PR waits with finished endpoints"
 }
