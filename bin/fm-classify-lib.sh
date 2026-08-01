@@ -301,6 +301,7 @@ task_is_waiting_for_captain_merge() {  # <state> <task-id>
   yolo=$(grep '^yolo=' "$meta" 2>/dev/null | tail -1 | cut -d= -f2- || true)
   [ "$yolo" = off ] || return 1
   [ ! -e "$state/.pr-poll-seen-$id" ] && [ ! -L "$state/.pr-poll-seen-$id" ] || return 1
+  [ ! -e "$state/.pr-poll-error-seen-$id" ] && [ ! -L "$state/.pr-poll-error-seen-$id" ] || return 1
   fm_pr_poll_artifacts_valid "$state" "$id" "$FM_CLASSIFY_PR_POLL_TEMPLATE"
 }
 
@@ -432,6 +433,25 @@ signal_crews_waiting_for_captain_merge() {  # <file> ...
     seen="$seen $task"
     state=${f%/*}
     task_is_waiting_for_captain_merge "$state" "$task" || return 1
+  done
+  [ -n "$seen" ]
+}
+
+signal_crews_safe_to_absorb() {  # <file> ...
+  local f base task state seen=""
+  for f in "$@"; do
+    base=${f##*/}
+    case "$base" in
+      *.status) task=${base%.status} ;;
+      *.turn-ended) task=${base%.turn-ended} ;;
+      *) continue ;;
+    esac
+    [ -n "$task" ] || continue
+    case " $seen " in *" $task "*) continue ;; esac
+    seen="$seen $task"
+    state=${f%/*}
+    task_is_waiting_for_captain_merge "$state" "$task" && continue
+    crew_is_provably_working "$task" || return 1
   done
   [ -n "$seen" ]
 }

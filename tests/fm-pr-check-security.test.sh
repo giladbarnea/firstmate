@@ -66,6 +66,7 @@ SH
 #!/usr/bin/env bash
 printf '%s\n' "$*" >> "$FM_TEST_GH_LOG"
 case " $* " in
+  *" auth status "*) exit "${FM_TEST_GH_AUTH_RC:-0}" ;;
   *" headRefOid "*) printf '%s\n' "${FM_TEST_GH_HEAD:-0123456789abcdef0123456789abcdef01234567}" ;;
   *"statusCheckRollup"*)
     [ "${FM_TEST_GH_FAIL:-0}" = 0 ] || exit 1
@@ -79,7 +80,7 @@ case " $* " in
       shift
     done
     json=$(printf '{"state":"%s","mergeable":"%s","mergeStateStatus":"%s","statusCheckRollup":[' \
-      "${FM_TEST_GH_STATE:-OPEN}" "${FM_TEST_GH_MERGEABLE:-MERGEABLE}" "${FM_TEST_GH_MERGE_STATE:-CLEAN}"
+      "${FM_TEST_GH_STATE-OPEN}" "${FM_TEST_GH_MERGEABLE:-MERGEABLE}" "${FM_TEST_GH_MERGE_STATE:-CLEAN}"
       separator=
       if [ -n "${FM_TEST_GH_CHECK_CONCLUSION:-}" ]; then
         printf '{"__typename":"CheckRun","conclusion":"%s"}' "$FM_TEST_GH_CHECK_CONCLUSION"
@@ -105,12 +106,13 @@ SH
   cat > "$fakebin/glab" <<'SH'
 #!/usr/bin/env bash
 printf '%s\n' "$*" >> "$FM_TEST_GLAB_LOG"
-[ "${FM_TEST_GLAB_FAIL:-0}" = 0 ] || exit 1
-[ "${FM_TEST_GLAB_SLEEP:-0}" = 0 ] || sleep "$FM_TEST_GLAB_SLEEP"
 case " $* " in
+  *" auth status "*) exit "${FM_TEST_GLAB_AUTH_RC:-0}" ;;
   *" api "*)
+    [ "${FM_TEST_GLAB_FAIL:-0}" = 0 ] || exit 1
+    [ "${FM_TEST_GLAB_SLEEP:-0}" = 0 ] || sleep "$FM_TEST_GLAB_SLEEP"
     printf '{"state":"%s","detailed_merge_status":"%s","has_conflicts":%s,"head_pipeline":' \
-      "${FM_TEST_GLAB_STATE:-opened}" "${FM_TEST_GLAB_MERGE_STATUS:-mergeable}" \
+      "${FM_TEST_GLAB_STATE-opened}" "${FM_TEST_GLAB_MERGE_STATUS:-mergeable}" \
       "${FM_TEST_GLAB_HAS_CONFLICTS:-false}"
     if [ -n "${FM_TEST_GLAB_PIPELINE_STATUS:-}" ]; then
       printf '{"status":"%s"}' "$FM_TEST_GLAB_PIPELINE_STATUS"
@@ -746,19 +748,18 @@ run_poll() {
 }
 
 test_static_poll_contract() {
-  local dir state out rc value
+  local dir out rc value
   dir=$(make_case poll-contract)
   make_poll_fixture "$dir"
 
-  for state in OPEN EMPTY MALFORMED; do
-    case "$state" in
-      EMPTY) value= ;;
-      MALFORMED) value='not-a-state' ;;
-      *) value=$state ;;
-    esac
+  out=$(FM_TEST_GH_STATE=OPEN run_poll "$dir")
+  [ "$out" = green ] || fail "static poll did not report a verified green pull request"
+  for value in '' not-a-state; do
     out=$(FM_TEST_GH_STATE="$value" run_poll "$dir")
-    [ -z "$out" ] || fail "static poll emitted for a non-event state"
+    [ "$out" = lookup-error ] || fail "static poll did not report an unreadable pull request state"
   done
+  out=$(FM_TEST_GH_STATE=OPEN FM_TEST_GH_MERGEABLE=UNKNOWN run_poll "$dir")
+  [ "$out" = unresolved ] || fail "static poll did not report an unresolved mergeability state"
   out=$(FM_TEST_GH_STATE=CLOSED run_poll "$dir")
   [ "$out" = closed ] || fail "static poll did not report a closed pull request"
   out=$(FM_TEST_GH_STATE=OPEN FM_TEST_GH_MERGEABLE=CONFLICTING run_poll "$dir")
@@ -775,12 +776,14 @@ test_static_poll_contract() {
   done
   for value in SUCCESS NEUTRAL SKIPPED ''; do
     out=$(FM_TEST_GH_STATE=OPEN FM_TEST_GH_CHECK_CONCLUSION="$value" run_poll "$dir")
-    [ -z "$out" ] || fail "static poll emitted for non-failing check conclusion '$value'"
+    [ "$out" = green ] || fail "static poll did not verify non-failing check conclusion '$value' as green"
   done
   out=$(FM_TEST_GH_STATE=MERGED run_poll "$dir")
   [ "$out" = merged ] || fail "static poll did not emit exactly one merged line"
   out=$(FM_TEST_GH_FAIL=1 run_poll "$dir")
-  [ -z "$out" ] || fail "static poll emitted after gh failure"
+  [ "$out" = lookup-error ] || fail "static poll did not report a gh lookup failure"
+  out=$(FM_TEST_GH_AUTH_RC=1 run_poll "$dir")
+  [ "$out" = credentials-needed ] || fail "static poll did not report missing GitHub credentials"
 
   mv "$dir/home/state/task-a.pr-poll" "$dir/home/state/task-a.pr-poll.missing"
   out=$(run_poll "$dir")
@@ -814,7 +817,7 @@ test_static_poll_contract() {
   set -e
   [ "$rc" -eq 0 ] || fail "watcher did not surface merged poll"
   [ "$(grep -c '^check: .*: merged$' "$dir/watch.out")" -eq 1 ] || fail "watcher did not convert merged output into exactly one wake"
-  pass "static poll reports merge, close, conflict, and failed-check events and stays silent for green or unreadable states"
+  pass "static poll reports explicit green, unresolved, event, credential, and lookup states"
 }
 
 test_atomic_interruption_leaves_no_partial_artifact() {
@@ -2672,7 +2675,8 @@ test_teardown_removes_poll_artifacts() {
   printf 'registration\n' > "$dir/home/state/task-a.pr-poll-registration"
   printf 'trust\n' > "$dir/home/state/task-a.check-trust"
   printf 'https://github.com/o/r/pull/1\tconflict\n' > "$dir/home/state/.pr-poll-seen-task-a"
-  chmod 0600 "$dir/home/state/.pr-poll-seen-task-a"
+  printf 'https://github.com/o/r/pull/1\tcredentials-needed\n' > "$dir/home/state/.pr-poll-error-seen-task-a"
+  chmod 0600 "$dir/home/state/.pr-poll-seen-task-a" "$dir/home/state/.pr-poll-error-seen-task-a"
   mkdir -p "$dir/home/state/.pr-check-quarantine"
   chmod 0700 "$dir/home/state/.pr-check-quarantine"
   printf 'legacy\n' > "$dir/home/state/.pr-check-quarantine/task-a.check.abc123"
@@ -2692,6 +2696,7 @@ SH
   [ ! -e "$dir/home/state/task-a.pr-poll-registration" ] || fail "teardown left the PR poll registration"
   [ ! -e "$dir/home/state/task-a.check-trust" ] || fail "teardown left the custom check registration"
   [ ! -e "$dir/home/state/.pr-poll-seen-task-a" ] || fail "teardown left the PR observation marker"
+  [ ! -e "$dir/home/state/.pr-poll-error-seen-task-a" ] || fail "teardown left the PR lookup-error marker"
   ! find "$dir/home/state/.pr-check-quarantine" -name 'task-a.*' -print 2>/dev/null | grep . >/dev/null \
     || fail "teardown left task quarantine artifacts"
 
@@ -2753,7 +2758,7 @@ SH
   [ "$(cat "$dir/home/state/.pr-check-quarantine/!noncanonical.check.abc123")" = 'noncanonical evidence' ] \
     || fail "teardown removed noncanonical quarantine evidence"
 
-  for artifact in check.sh pr-poll pr-poll-seen; do
+  for artifact in check.sh pr-poll pr-poll-seen pr-poll-error-seen; do
     dir=$(make_case "teardown-final-directory-${artifact//./-}")
     fakebin="$dir/fakebin"
     fm_write_meta "$dir/home/state/task-a.meta" \
@@ -2772,8 +2777,12 @@ SH
         artifact_path="$dir/home/state/task-a.pr-poll"
         counterpart="$dir/home/state/task-a.check.sh"
         ;;
-      *)
+      pr-poll-seen)
         artifact_path="$dir/home/state/.pr-poll-seen-task-a"
+        counterpart="$dir/home/state/task-a.check.sh"
+        ;;
+      *)
+        artifact_path="$dir/home/state/.pr-poll-error-seen-task-a"
         counterpart="$dir/home/state/task-a.check.sh"
         ;;
     esac
@@ -2869,12 +2878,16 @@ gitlab.example
 group/subgroup/project
 7" ] || fail "published GitLab sidecar bytes were not exact"
 
-  # The authenticated API reading reports only the four lifecycle events the
-  # supervisor needs. Unreadable or malformed responses stay silent.
-  for value in opened locked '' not-a-state MERGED merged-but-not; do
+  out=$(FM_TEST_GLAB_STATE=opened run_poll "$dir")
+  [ "$out" = green ] || fail "GitLab poll did not report a verified green merge request"
+  for value in locked '' not-a-state MERGED merged-but-not; do
     out=$(FM_TEST_GLAB_STATE="$value" run_poll "$dir")
-    [ -z "$out" ] || fail "GitLab poll emitted for a non-event state"
+    [ "$out" = lookup-error ] || fail "GitLab poll did not report an unreadable merge request state"
   done
+  out=$(FM_TEST_GLAB_STATE=opened FM_TEST_GLAB_MERGE_STATUS=checking run_poll "$dir")
+  [ "$out" = unresolved ] || fail "GitLab poll did not report unresolved mergeability"
+  out=$(FM_TEST_GLAB_STATE=opened FM_TEST_GLAB_PIPELINE_STATUS=running run_poll "$dir")
+  [ "$out" = unresolved ] || fail "GitLab poll did not report a pending pipeline"
   out=$(FM_TEST_GLAB_STATE=closed run_poll "$dir")
   [ "$out" = closed ] || fail "GitLab poll did not report a closed merge request"
   out=$(FM_TEST_GLAB_STATE=opened FM_TEST_GLAB_MERGE_STATUS=conflict run_poll "$dir")
@@ -2888,7 +2901,9 @@ group/subgroup/project
   out=$(FM_TEST_GLAB_STATE=merged run_poll "$dir")
   [ "$out" = merged ] || fail "GitLab poll did not emit exactly one merged line"
   out=$(FM_TEST_GLAB_FAIL=1 run_poll "$dir")
-  [ -z "$out" ] || fail "GitLab poll emitted after a glab failure"
+  [ "$out" = lookup-error ] || fail "GitLab poll did not report a glab lookup failure"
+  out=$(FM_TEST_GLAB_AUTH_RC=1 run_poll "$dir")
+  [ "$out" = credentials-needed ] || fail "GitLab poll did not report missing credentials"
 
   # glab reads the URL-encoded project path through the host-bound API, so the
   # watcher needs neither a current Git repository nor a merge request URL.
@@ -2897,9 +2912,8 @@ group/subgroup/project
   ! grep -qF -- "$url" "$dir/glab.log" \
     || fail "GitLab poll passed a merge request URL to glab"
 
-  # An absent CLI must produce no wake rather than a false merge. The whole
-  # search path is mirrored without glab, because a real glab anywhere on
-  # PATH would make this prove nothing.
+  # The whole search path is mirrored without glab, because a real glab
+  # anywhere on PATH would make this prove nothing.
   noglab="$dir/noglab"
   mkdir -p "$noglab"
   while IFS= read -r bindir; do
@@ -2919,7 +2933,7 @@ EOF
   out=$(FM_TEST_GLAB_STATE=merged FM_TEST_GH_LOG="$dir/gh.log" FM_TEST_GLAB_LOG="$dir/glab.log" \
     PATH="$noglab" \
     bash "$state/task-a.check.sh")
-  [ -z "$out" ] || fail "GitLab poll emitted with glab absent from PATH"
+  [ "$out" = lookup-error ] || fail "GitLab poll did not report a missing glab executable"
 
   # A doctored sidecar cannot redirect the poll: the stored parts must rebuild
   # the stored URL exactly.
@@ -2987,7 +3001,7 @@ EOF
   [ "$rc" -eq 2 ] || fail "merge wrapper did not refuse a GitLab merge request URL"
   [ ! -s "$dir/gh-axi.log" ] || fail "merge wrapper reached the GitHub CLI for a GitLab URL"
 
-  pass "GitLab merge requests report merge, close, conflict, and failed-pipeline events on any instance without false wakes"
+  pass "GitLab polling reports explicit lifecycle, unresolved, credential, and lookup states"
 }
 
 seed_canonical_poll() {
@@ -3243,7 +3257,7 @@ test_external_merge_transition_retires_only_terminal_poll() {
   [ "$rc" -eq 0 ] || fail "open-green watcher cycle failed: $(cat "$dir/open-green.err")"
   case "$(cat "$dir/open-green.out")" in check:*z-stop.check.sh:*stop-cycle) ;; *) fail "open-green did not stay silent" ;; esac
 
-  for label in conflict checks-failed closed; do
+  for label in conflict checks-failed unresolved closed; do
     rm -f "$state/.last-check"
     set +e
     case "$label" in
@@ -3253,6 +3267,10 @@ test_external_merge_transition_retires_only_terminal_poll() {
         ;;
       checks-failed)
         FM_TEST_GH_STATE=OPEN FM_TEST_GH_CHECK_CONCLUSION=FAILURE \
+          run_watcher_bounded "$dir/home" "$dir/fakebin" > "$dir/$label.out" 2> "$dir/$label.err"
+        ;;
+      unresolved)
+        FM_TEST_GH_STATE=OPEN FM_TEST_GH_MERGEABLE=UNKNOWN \
           run_watcher_bounded "$dir/home" "$dir/fakebin" > "$dir/$label.out" 2> "$dir/$label.err"
         ;;
       closed)
@@ -3274,6 +3292,10 @@ test_external_merge_transition_retires_only_terminal_poll() {
         ;;
       checks-failed)
         FM_TEST_GH_STATE=OPEN FM_TEST_GH_CHECK_CONCLUSION=FAILURE \
+          run_watcher_bounded "$dir/home" "$dir/fakebin" > "$dir/$label-repeat.out" 2> "$dir/$label-repeat.err"
+        ;;
+      unresolved)
+        FM_TEST_GH_STATE=OPEN FM_TEST_GH_MERGEABLE=UNKNOWN \
           run_watcher_bounded "$dir/home" "$dir/fakebin" > "$dir/$label-repeat.out" 2> "$dir/$label-repeat.err"
         ;;
       closed)
@@ -3309,8 +3331,17 @@ test_external_merge_transition_retires_only_terminal_poll() {
     rc=$?
     set -e
     [ "$rc" -eq 0 ] || fail "$label watcher cycle failed: $(cat "$dir/$label.err")"
-    case "$(cat "$dir/$label.out")" in check:*z-stop.check.sh:*stop-cycle) ;; *) fail "$label did not stay silent" ;; esac
+    case "$(cat "$dir/$label.out")" in check:*task-a.check.sh:*lookup-error) ;; *) fail "$label lookup error was not surfaced" ;; esac
     [ "$(poll_artifact_snapshot "$state" task-a)" = "$before" ] || fail "$label changed the armed poll"
+
+    rm -f "$state/.last-check"
+    set +e
+    FM_TEST_GH_STATE=OPEN run_watcher_bounded "$dir/home" "$dir/fakebin" > "$dir/$label-clear.out" 2> "$dir/$label-clear.err"
+    rc=$?
+    set -e
+    [ "$rc" -eq 0 ] || fail "$label clear watcher cycle failed: $(cat "$dir/$label-clear.err")"
+    case "$(cat "$dir/$label-clear.out")" in check:*z-stop.check.sh:*stop-cycle) ;; *) fail "green transition after $label did not stay silent" ;; esac
+    [ ! -e "$state/.pr-poll-error-seen-task-a" ] || fail "green transition did not clear the $label error"
   done
 
   rm -f "$state/z-stop.check.sh" "$state/z-stop.check-trust" "$state/.last-check"
@@ -3322,7 +3353,56 @@ test_external_merge_transition_retires_only_terminal_poll() {
   case "$(cat "$dir/merged.out")" in check:*task-a.check.sh:*merged) ;; *) fail "external merge did not preserve its notification" ;; esac
   assert_poll_absent "$state" task-a
   [ ! -e "$state/.pr-poll-seen-task-a" ] || fail "merged retirement retained the observation marker"
+  [ ! -e "$state/.pr-poll-error-seen-task-a" ] || fail "merged retirement retained the lookup-error marker"
   pass "PR monitoring surfaces state transitions once, keeps non-merged work armed, and retires only an exact merge"
+}
+
+test_pr_poll_errors_preserve_event_dedup_until_green() {
+  local dir state rc
+  dir=$(make_case pr-poll-error-dedup)
+  state="$dir/home/state"
+  write_poll_meta "$state" task-a https://github.com/o/r/pull/20
+  seed_canonical_poll "$dir" task-a https://github.com/o/r/pull/20
+  add_stop_custom_check "$dir"
+
+  set +e
+  FM_TEST_GH_STATE=OPEN FM_TEST_GH_MERGEABLE=CONFLICTING \
+    run_watcher_bounded "$dir/home" "$dir/fakebin" > "$dir/conflict.out" 2> "$dir/conflict.err"
+  rc=$?
+  set -e
+  [ "$rc" -eq 0 ] || fail "initial conflict watcher cycle failed: $(cat "$dir/conflict.err")"
+  case "$(cat "$dir/conflict.out")" in check:*task-a.check.sh:*conflict) ;; *) fail "initial conflict was not surfaced" ;; esac
+
+  rm -f "$state/.last-check"
+  set +e
+  FM_TEST_GH_AUTH_RC=1 run_watcher_bounded "$dir/home" "$dir/fakebin" > "$dir/auth.out" 2> "$dir/auth.err"
+  rc=$?
+  set -e
+  [ "$rc" -eq 0 ] || fail "credential failure watcher cycle failed: $(cat "$dir/auth.err")"
+  case "$(cat "$dir/auth.out")" in check:*task-a.check.sh:*credentials-needed) ;; *) fail "credential failure was not surfaced" ;; esac
+  grep -q $'\tconflict$' "$state/.pr-poll-seen-task-a" || fail "credential failure erased the conflict observation"
+  grep -q $'\tcredentials-needed$' "$state/.pr-poll-error-seen-task-a" || fail "credential failure was not recorded"
+
+  rm -f "$state/.last-check"
+  set +e
+  FM_TEST_GH_STATE=OPEN FM_TEST_GH_MERGEABLE=CONFLICTING \
+    run_watcher_bounded "$dir/home" "$dir/fakebin" > "$dir/recovered-conflict.out" 2> "$dir/recovered-conflict.err"
+  rc=$?
+  set -e
+  [ "$rc" -eq 0 ] || fail "recovered conflict watcher cycle failed: $(cat "$dir/recovered-conflict.err")"
+  case "$(cat "$dir/recovered-conflict.out")" in check:*z-stop.check.sh:*stop-cycle) ;; *) fail "unchanged conflict woke again after credential recovery" ;; esac
+  [ ! -e "$state/.pr-poll-error-seen-task-a" ] || fail "successful lookup did not clear the credential observation"
+  grep -q $'\tconflict$' "$state/.pr-poll-seen-task-a" || fail "recovered conflict lost its deduplication marker"
+
+  rm -f "$state/.last-check"
+  set +e
+  FM_TEST_GH_STATE=OPEN run_watcher_bounded "$dir/home" "$dir/fakebin" > "$dir/green.out" 2> "$dir/green.err"
+  rc=$?
+  set -e
+  [ "$rc" -eq 0 ] || fail "green watcher cycle failed: $(cat "$dir/green.err")"
+  case "$(cat "$dir/green.out")" in check:*z-stop.check.sh:*stop-cycle) ;; *) fail "green transition did not stay silent" ;; esac
+  [ ! -e "$state/.pr-poll-seen-task-a" ] || fail "verified green did not clear the conflict observation"
+  pass "credential errors surface without ending unresolved-event deduplication before green"
 }
 
 test_retirement_refuses_replacement_and_nonterminal_results() {
@@ -3491,6 +3571,7 @@ test_merged_poll_retires_once
 test_persistent_secondmate_retirement_is_poll_only
 test_retirement_crash_recovery
 test_external_merge_transition_retires_only_terminal_poll
+test_pr_poll_errors_preserve_event_dedup_until_green
 test_retirement_refuses_replacement_and_nonterminal_results
 test_retirement_queue_failure_and_receipt_tampering
 test_gitlab_merged_poll_retires

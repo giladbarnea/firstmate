@@ -201,7 +201,7 @@ tests/fm-turnend-guard.test.sh
 ## PR-ready silence
 
 The authenticated PR-wait boundary was verified on 2026-08-01 through the normal watcher, away-mode daemon, and forge poll entry points.
-The classifier required a finished `yolo=off` ship, no open keyed captain decision or PR event, and the complete metadata-bound static poll before suppressing any endpoint signal.
+The classifier required a finished `yolo=off` ship, no open keyed captain decision, PR event, or monitoring error, and the complete metadata-bound static poll before suppressing any endpoint signal.
 
 ```sh
 bin/fm-test-run.sh tests/fm-watch-triage.test.sh
@@ -213,13 +213,19 @@ Observed bounded output:
 
 ```text
 ok - authenticated PR-wait classification is backend-neutral and yields to decisions, blockers, failures, and poll corruption
+ok - coalesced merge-waiting and working signals are absorbed together
 ok - an authenticated PR wait absorbs signal, stale, busy-age, heartbeat, and no-change churn without touching unlanded work
 ok - away-mode signal, stale, housekeeping, and heartbeat paths stay silent only for an authenticated PR wait
+ok - credential errors surface without ending unresolved-event deduplication before green
 ok - PR monitoring surfaces state transitions once, keeps non-merged work armed, and retires only an exact merge
 ```
 
 The watcher regression also preserves byte hashes for task metadata and all three poll artifacts plus an isolated-copy sentinel.
-The forge regression keeps non-merged PR state armed, deduplicates an unchanged close, conflict, or failed-check result, resets that observation after green, and retains merge-only retirement.
+The review found that empty poll output had combined verified green, unresolved, credential, and lookup outcomes.
+Separate PR-event and monitoring-error records were necessary because a monitoring error must not erase an earlier conflict.
+The signal fix classifies each task in a coalesced batch, while the all-merge-wait check remains before away-mode handling.
+The forge regression keeps non-merged PR state armed and deduplicates unchanged unresolved states, lifecycle events, credential needs, and lookup failures.
+Monitoring errors leave the last PR event intact, verified green clears both records, and only merge retires the poll.
 
 ## Wedge-alarm channels
 

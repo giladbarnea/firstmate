@@ -9,20 +9,22 @@ firstmate's always-loaded operating contract and routing index for conditional p
 ## Event-driven supervision
 
 A zero-token bash watcher (`bin/fm-watch.sh`) sleeps on the fleet, classifies detected wakes in bash, and wakes the first mate only when something is actionable.
-Actionable wakes include captain-relevant status signals, no-verb signals whose crew is not provably working, authenticated check output such as PR state monitoring or an X-mode mention, stale panes whose crew is not provably working whether their status log looks terminal or non-terminal, provably-working stale panes that persist past `FM_STALE_ESCALATE_SECS`, declared external waits that remain paused past `FM_PAUSE_RESURFACE_SECS`, and heartbeat backstop hits.
+Actionable wakes include captain-relevant status signals, no-verb signal batches with any task that is neither merge-waiting nor provably working, authenticated check output such as PR state monitoring or an X-mode mention, stale panes whose crew is not provably working whether their status log looks terminal or non-terminal, provably-working stale panes that persist past `FM_STALE_ESCALATE_SECS`, declared external waits that remain paused past `FM_PAUSE_RESURFACE_SECS`, and heartbeat backstop hits.
 Repeated provably-working stale escalations on the same unchanged pane add an escalation count to the wake reason and, at `FM_WEDGE_DEMAND_INSPECT_COUNT`, a `demand-deep-inspection` marker.
 A busy pane is otherwise exempt from staleness, but only until its latest `state/<id>.turn-ended` marker reaches `FM_BUSY_TURN_MAX_SECS`, or its `state/<id>.meta` spawn record reaches that age before any turn completes; past that bound it is routed through the same wedge escalation, with the identical reason, escalation count, and `demand-deep-inspection` marker, for inspection only - never an automatic interrupt, signal, or restart.
-An authenticated PR-ready ship with `yolo=off` bypasses endpoint capture and status backstops while its latest event remains `done` and no keyed captain decision or unresolved PR event is open.
+An authenticated PR-ready ship with `yolo=off` bypasses endpoint capture and status backstops while its latest event remains `done` and no keyed captain decision, unresolved PR event, or monitoring error is open.
 The shared predicate applies before backend dispatch, so tmux, Herdr, Zellij, Orca, and cmux all ignore finished endpoints while retaining Herdr's native blocked transition.
 `AGENTS.md` section 7 owns the corresponding lifecycle and preservation rule.
 Those actionable wakes are written to a durable local queue (`state/.wake-queue`) before detector state advances, so a missed process exit can be recovered by draining the queue.
-The canonical PR poll stays silent for an open green change and lookup errors, and emits exact `merged`, `closed`, `conflict`, or `checks-failed` events.
-The watcher records each non-merged event by PR URL and result, so unchanged failures stay silent while a confirmed green observation resets the transition marker.
+The canonical PR poll emits one exact state: `green`, `unresolved`, `merged`, `closed`, `conflict`, `checks-failed`, `credentials-needed`, or `lookup-error`.
+The watcher keeps `green` silent and records PR events separately from monitoring errors, so unchanged results stay silent and an error never clears event deduplication.
+A confirmed `green` result clears both records.
 When a canonical validated PR poll returns exactly `merged`, the watcher appends that durable notification before publishing a private receipt bound to the poll's registration, bytes, file identities, metadata, provider, URL, and task ID.
 The receipt makes retirement safely retryable across restarts: fixed-path recovery revalidates the same evidence, removes the runnable check first, removes its registration and data sidecars, removes the receipt last, and preserves task metadata including `pr=` and `pr_head=`.
 A concurrent replacement remains armed, every non-merged observation leaves the canonical poll intact, and retirement never performs task or persistent-secondmate cleanup.
 `bin/fm-pr-lib.sh` owns the receipt format and strict identity mechanics, while `bin/fm-watch.sh` owns queue-before-retirement and transition-dedup ordering.
-No-verb wakes, such as `working:` notes and bare turn-ended signals, are benign only when `bin/fm-crew-state.sh` reports positive evidence that the crew is still working: an actively running no-mistakes step attributed to that crew's current code, or an exact busy verdict from the semantic busy-state contract.
+No-verb wakes, such as `working:` notes and bare turn-ended signals, are benign only when every referenced task is an authenticated PR wait or `bin/fm-crew-state.sh` reports positive evidence that its crew is still working.
+That evidence is an actively running no-mistakes step attributed to the crew's current code, or an exact busy verdict from the semantic busy-state contract.
 A crew that declares `paused:` for a known external wait is separately absorbed while idle and re-surfaced only on the longer pause cadence, rather than being treated as a possible wedge.
 For an ordinary crew that has stopped, the normal-mode watcher first surfaces one stale wake, then applies that same cadence to an unchanged `paused:` or durable `captain-held` endpoint only when the backend confidently reports its agent dead.
 Live or inconclusive liveness remains fail-open at that initial surface, and the secondmate idle-endpoint exemption is unchanged.

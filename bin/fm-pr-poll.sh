@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
 # Static watcher program for a validated PR/MR poll sidecar.
-# It emits one exact lifecycle event for merge, close, conflict, or failed checks
-# and stays silent for an open green change and every error. The provider-tagged
-# identity is data in the sidecar and is never
-# interpolated into this source: these bytes are identical for every task.
+# It emits one exact state for every validated poll: green, unresolved, a PR
+# lifecycle event, or a credential/lookup error. The provider-tagged identity is
+# data in the sidecar and is never interpolated into this source: these bytes are
+# identical for every task.
 # Each provider is read through its own standard CLI, gh for GitHub and glab
 # for GitLab, so an upstream checkout needs no extra tooling to follow either.
 set -u
@@ -62,6 +62,9 @@ case "$provider" in
       .|..|*[!A-Za-z0-9._-]*) exit 0 ;;
     esac
     [ "$url" = "https://github.com/$owner/$repo/pull/$number" ] || exit 0
+    command -v gh >/dev/null 2>&1 || { printf '%s\n' lookup-error; exit 0; }
+    gh auth status --hostname "$host" >/dev/null 2>&1 \
+      || { printf '%s\n' credentials-needed; exit 0; }
     # shellcheck disable=SC2016  # The jq program expands its own $value variable.
     result=$(gh pr view "$url" --json state,mergeable,mergeStateStatus,statusCheckRollup --jq '
       def check_failed:
@@ -73,15 +76,29 @@ case "$provider" in
           .state as $value | ["ERROR", "FAILURE"] | index($value) != null
         else false
         end;
+      def check_green:
+        if .__typename == "CheckRun" then
+          .conclusion as $value | ["NEUTRAL", "SKIPPED", "SUCCESS"] | index($value) != null
+        elif .__typename == "StatusContext" then
+          .state == "SUCCESS"
+        else false
+        end;
       if .state == "MERGED" then "merged"
       elif .state == "CLOSED" then "closed"
-      elif .state != "OPEN" then empty
+      elif .state != "OPEN" then "lookup-error"
       elif .mergeable == "CONFLICTING" or .mergeStateStatus == "DIRTY" then "conflict"
       elif any(.statusCheckRollup[]?; check_failed) then "checks-failed"
-      else empty
+      elif .mergeable != "MERGEABLE" or .mergeStateStatus != "CLEAN" then "unresolved"
+      elif all(.statusCheckRollup[]?; check_green) then "green"
+      else "unresolved"
       end
-    ' 2>/dev/null) || exit 0
-    [ -z "$result" ] || printf '%s\n' "$result"
+    ' 2>/dev/null) || { printf '%s\n' lookup-error; exit 0; }
+    case "$result" in
+      green|unresolved|merged|closed|conflict|checks-failed|credentials-needed|lookup-error)
+        printf '%s\n' "$result"
+        ;;
+      *) printf '%s\n' lookup-error ;;
+    esac
     ;;
   gitlab)
     [ "${#host}" -ge 1 ] && [ "${#host}" -le 253 ] || exit 0
@@ -111,21 +128,32 @@ case "$provider" in
     done
     [ "$segments" -ge 2 ] || exit 0
     [ "$url" = "https://$host/$path/-/merge_requests/$number" ] || exit 0
-    command -v jq >/dev/null 2>&1 || exit 0
+    command -v glab >/dev/null 2>&1 || { printf '%s\n' lookup-error; exit 0; }
+    command -v jq >/dev/null 2>&1 || { printf '%s\n' lookup-error; exit 0; }
+    glab auth status --hostname "$host" >/dev/null 2>&1 \
+      || { printf '%s\n' credentials-needed; exit 0; }
     encoded_path=${path//\//%2F}
     raw=$(glab api "projects/$encoded_path/merge_requests/$number?with_merge_status_recheck=true" \
-      --hostname "$host" 2>/dev/null) || exit 0
+      --hostname "$host" 2>/dev/null) || { printf '%s\n' lookup-error; exit 0; }
     result=$(printf '%s\n' "$raw" | jq -er '
       if .state == "merged" then "merged"
       elif .state == "closed" then "closed"
-      elif .state != "opened" then empty
+      elif .state != "opened" then "lookup-error"
       elif .has_conflicts == true or .detailed_merge_status == "conflict" then "conflict"
       elif ((.head_pipeline.status? // .pipeline.status? // "") as $value
         | ["failed", "canceled", "cancelled"] | index($value) != null) then "checks-failed"
-      else empty
+      elif .detailed_merge_status != "mergeable" then "unresolved"
+      elif ((.head_pipeline.status? // .pipeline.status? // "") as $value
+        | $value == "" or $value == "success" or $value == "skipped") then "green"
+      else "unresolved"
       end
-    ' 2>/dev/null) || exit 0
-    printf '%s\n' "$result"
+    ' 2>/dev/null) || { printf '%s\n' lookup-error; exit 0; }
+    case "$result" in
+      green|unresolved|merged|closed|conflict|checks-failed|credentials-needed|lookup-error)
+        printf '%s\n' "$result"
+        ;;
+      *) printf '%s\n' lookup-error ;;
+    esac
     ;;
   *) exit 0 ;;
 esac

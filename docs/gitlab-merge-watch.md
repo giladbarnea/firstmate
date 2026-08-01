@@ -1,7 +1,8 @@
 # GitLab merge request watch verification
 
 Empirical record for the merge request watch on GitLab, alongside the existing GitHub watch.
-The current API and poll commands below were run on 2026-08-01 and their bounded output is reproduced exactly.
+The API commands below were run on 2026-08-01 and their bounded output is reproduced exactly.
+The poll examples show the current state contract covered by the hermetic regression.
 The provider-tag migration and missing-tool evidence retained later in this record was run on 2026-07-21.
 
 ## Versions
@@ -18,7 +19,8 @@ GNU bash, version 3.2.57(1)-release (arm64-apple-darwin25)
 
 All live evidence here reads <https://gitlab.com/KarotKris/gitlab-merge-watch-fixture>, a public project that exists only to be this evidence.
 It holds one deliberately merged merge request and one deliberately open one, so both outcomes can be shown against real data.
-Every command against it reads a public merge request and needs no credential, so a reader can rerun each one and see the same output.
+The direct API evidence reads public merge requests.
+The canonical poll still requires valid `glab` credentials because loss of authenticated monitoring must surface.
 Its README asks that the open merge request be left open.
 
 A non-default host appears below only as the placeholder `gitlab.example`, which resolves nowhere.
@@ -35,8 +37,8 @@ The tests cover arbitrary validated hosts and nested project paths without hard-
 
 The watcher runs without a current Git repository, so it addresses the merge request through `glab api` with a URL-encoded project path and the validated host.
 GitLab monitoring requires `jq`, and arming refuses when it is missing.
-One API response then classifies merge, close, conflict, and failed-pipeline states without parsing rendered text.
-The query asks GitLab to refresh merge status, but treats every missing, malformed, or unreadable field as silence rather than inventing an event.
+One API response then classifies green, unresolved, merge, close, conflict, and failed-pipeline states without parsing rendered text.
+The query asks GitLab to refresh merge status and returns `lookup-error` for missing, malformed, or unreadable results.
 
 The two public fixture merge requests returned these bounded shapes:
 
@@ -98,18 +100,21 @@ group/subgroup/project
 70:957244
 ```
 
-Running each published poll the way the watcher does, where an empty result means the poll stayed silent and produced no wake:
+Running each published poll the way the watcher does produces one explicit state:
 
 ```
 $ fm-pr-poll.sh --validated $(tr '\n' ' ' < state/e1.pr-poll)
 merged
 $ fm-pr-poll.sh --validated $(tr '\n' ' ' < state/e2.pr-poll)
+green
 $ fm-pr-poll.sh --validated $(tr '\n' ' ' < state/e3.pr-poll)
+credentials-needed
 ```
 
 The merged fixture merge request produces exactly one `merged` line.
-The open green merge request produces nothing, and the unreachable placeholder host produces nothing rather than a false event.
-The close, conflict, failed-pipeline, malformed-output, and repeat-event matrix is hermetic in `tests/fm-pr-check-security.test.sh`.
+The open merge request produces `green` while it remains mergeable with no failed or pending pipeline.
+The placeholder host produces `credentials-needed` without configured credentials, or `lookup-error` if authenticated lookup fails.
+The green, unresolved, close, conflict, failed-pipeline, credential, lookup, malformed-output, and repeat-event matrix is hermetic in `tests/fm-pr-check-security.test.sh`.
 
 The same bytes work in the watcher's sidecar-driven mode, where the published check locates its own record:
 
@@ -118,17 +123,19 @@ $ state/e1x.check.sh
 merged
 ```
 
-## A missing poll tool produces no wake, never a false merge
+## A missing poll tool surfaces a lookup error, never a false merge
 
-The GitLab poll is silent on every error by design, so a missing `glab` or `jq` would otherwise be indistinguishable from a merge request that never changes.
-With `glab` removed from `PATH`, the poll stays silent even for the merge request that is genuinely merged:
+The GitLab poll distinguishes missing tools from valid PR states.
+With `glab` removed from `PATH`, each validated poll reports `lookup-error`:
 
 ```
 $ PATH="$noglab" fm-pr-poll.sh --validated $(tr '\n' ' ' < state/e1.pr-poll)
+lookup-error
 $ PATH="$noglab" fm-pr-poll.sh --validated $(tr '\n' ' ' < state/e3.pr-poll)
+lookup-error
 ```
 
-Arming is the one point where that can be reported, so it refuses there instead of arming a watch that can never fire.
+Arming also refuses when the required tool is already missing.
 The `noglab` fixture below retains `jq` and removes only `glab`:
 
 ```

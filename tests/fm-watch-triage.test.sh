@@ -134,6 +134,7 @@ seed_pr_wait() {  # <state-dir> <id> <backend> <window> <worktree>
     || fail "could not prepare the PR-wait fixture"
   fm_pr_poll_publish_prepared || fail "could not publish the PR-wait fixture"
   printf 'done: PR %s checks green\n' "$url" > "$state/$id.status"
+  touch "$state/.last-check"
 }
 
 reap() { kill "$1" 2>/dev/null || true; wait "$1" 2>/dev/null || true; }
@@ -423,6 +424,22 @@ test_signal_crew_provably_working_classifier() {
   pass "signal_crew_provably_working: benign only when every referenced crew is provably working"
 }
 
+test_signal_crews_safe_to_absorb_classifier() {
+  local dir fakebin state
+  dir=$(make_case signal-safe-to-absorb); fakebin="$dir/fakebin"; state="$dir/state"
+  seed_pr_wait "$state" ready tmux test:fm-ready "$dir/worktree"
+  printf 'working: validating\n' > "$state/active.status"
+  export FM_CREW_STATE_BIN="$fakebin/fm-crew-state.sh"
+  export FM_FAKE_CREW_STATE_active='state: working · source: run-step · validating (running)'
+  signal_crews_safe_to_absorb "$state/ready.status" "$state/active.status" \
+    || fail "a merge-waiting task and a provably-working task were not safe together"
+  FM_FAKE_CREW_STATE_active='state: done · source: run-step · run passed'
+  ! signal_crews_safe_to_absorb "$state/ready.status" "$state/active.status" \
+    || fail "a coalesced batch with a stopped non-waiting task was treated as safe"
+  unset FM_FAKE_CREW_STATE_active
+  pass "coalesced signals are safe when each task is merge-waiting or provably working"
+}
+
 # --- benign wakes are absorbed ONLY when the crew is provably working ---------
 
 test_provably_working_signal_absorbed() {
@@ -445,6 +462,26 @@ test_provably_working_signal_absorbed() {
   [ -e "$state/.last-watcher-beat" ] || fail "watcher beacon was not touched while absorbing"
   reap "$pid"
   pass "a no-verb signal whose crew is provably working is absorbed (no exit, no queue, suppressor advanced, beacon present)"
+}
+
+test_mixed_pr_wait_and_working_signals_absorbed() {
+  local dir state fakebin out pid
+  dir=$(make_case mixed-pr-wait-working); state="$dir/state"; fakebin="$dir/fakebin"; out="$dir/watch.out"
+  seed_pr_wait "$state" ready tmux test:fm-ready "$dir/worktree"
+  printf 'working: validating\n' > "$state/active.status"
+  export FM_FAKE_CREW_STATE_active='state: working · source: run-step · validating (running)'
+  watch_bg "$state" "$fakebin" "$out"
+  pid=$!
+  if ! wait_live "$pid" 30; then
+    reap "$pid"; fail "mixed merge-waiting and working signals woke supervision: $(cat "$out")"
+  fi
+  [ ! -s "$out" ] || fail "mixed safe signals printed a wake reason: $(cat "$out")"
+  [ ! -s "$state/.wake-queue" ] || fail "mixed safe signals enqueued a durable wake record"
+  [ -s "$state/.seen-ready_status" ] || fail "merge-waiting signal suppressor was not advanced"
+  [ -s "$state/.seen-active_status" ] || fail "working signal suppressor was not advanced"
+  reap "$pid"
+  unset FM_FAKE_CREW_STATE_active
+  pass "coalesced merge-waiting and working signals are absorbed together"
 }
 
 test_turn_ended_provably_working_absorbed() {
@@ -1708,7 +1745,9 @@ test_crew_is_provably_working_classifier
 test_status_is_paused_classifier
 test_crew_absorb_class_classifier
 test_signal_crew_provably_working_classifier
+test_signal_crews_safe_to_absorb_classifier
 test_provably_working_signal_absorbed
+test_mixed_pr_wait_and_working_signals_absorbed
 test_turn_ended_provably_working_absorbed
 test_turn_ended_not_working_surfaced
 test_working_note_not_working_surfaced

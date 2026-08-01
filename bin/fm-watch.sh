@@ -455,21 +455,26 @@ scan_signals() {
   return 0
 }
 
-pr_poll_seen_path() { printf '%s/.pr-poll-seen-%s' "$STATE" "$1"; }
+pr_poll_observation_path() {  # <event|error> <task-id>
+  case "$1" in
+    event) printf '%s/.pr-poll-seen-%s' "$STATE" "$2" ;;
+    error) printf '%s/.pr-poll-error-seen-%s' "$STATE" "$2" ;;
+  esac
+}
 
-pr_poll_seen_matches() {  # <task-id> <result>
-  local id=$1 result=$2 path
-  path=$(pr_poll_seen_path "$id")
+pr_poll_observation_matches() {  # <event|error> <task-id> <result>
+  local kind=$1 id=$2 result=$3 path
+  path=$(pr_poll_observation_path "$kind" "$id")
   [ -f "$path" ] && [ ! -L "$path" ] || return 1
   [ "$(fm_pr_file_link_count "$path")" = 1 ] || return 1
   [ "$(cat "$path" 2>/dev/null || true)" = "${FM_PR_POLL_SNAPSHOT_URL}"$'\t'"$result" ]
 }
 
-pr_poll_seen_record() {  # <task-id> <result>
-  local id=$1 result=$2 path tmp
-  path=$(pr_poll_seen_path "$id")
+pr_poll_observation_record() {  # <event|error> <task-id> <result>
+  local kind=$1 id=$2 result=$3 path tmp
+  path=$(pr_poll_observation_path "$kind" "$id")
   [ ! -d "$path" ] || return 1
-  tmp=$(mktemp "$STATE/.fm-pr-poll-seen.XXXXXX") || return 1
+  tmp=$(mktemp "$STATE/.fm-pr-poll-observation.XXXXXX") || return 1
   if ! printf '%s\t%s\n' "$FM_PR_POLL_SNAPSHOT_URL" "$result" > "$tmp" \
     || ! chmod 0600 "$tmp" \
     || ! mv -f -- "$tmp" "$path"; then
@@ -479,7 +484,14 @@ pr_poll_seen_record() {  # <task-id> <result>
   [ -f "$path" ] && [ ! -L "$path" ] && [ "$(fm_pr_file_link_count "$path")" = 1 ]
 }
 
-pr_poll_seen_clear() { rm -f -- "$(pr_poll_seen_path "$1")"; }
+pr_poll_observation_clear() { rm -f -- "$(pr_poll_observation_path "$1" "$2")"; }
+
+pr_poll_observations_clear() {
+  local id=$1 result=0
+  pr_poll_observation_clear event "$id" || result=1
+  pr_poll_observation_clear error "$id" || result=1
+  return "$result"
+}
 
 run_check_process() {
   local c=$1
@@ -798,9 +810,7 @@ while :; do
           continue
         fi
       fi
-      if [ -z "$out" ]; then
-        [ "$is_pr_poll" -eq 0 ] || pr_poll_seen_clear "$id" \
-          || triage_log "could not clear the PR observation marker for $id"
+      if [ "$is_pr_poll" -eq 0 ] && [ -z "$out" ]; then
         continue
       fi
       if [ "$is_pr_poll" -eq 1 ] \
@@ -808,11 +818,28 @@ while :; do
         triage_log "ignored a PR result whose authenticated snapshot changed for $id"
         continue
       fi
-      case "$is_pr_poll:$out" in
-        1:closed|1:conflict|1:checks-failed)
-          pr_poll_seen_matches "$id" "$out" && continue
-          ;;
-      esac
+      if [ "$is_pr_poll" -eq 1 ]; then
+        case "$out" in
+          green)
+            pr_poll_observations_clear "$id" \
+              || triage_log "could not clear the green PR observation markers for $id"
+            continue
+            ;;
+          merged) ;;
+          closed|conflict|checks-failed|unresolved)
+            pr_poll_observation_clear error "$id" \
+              || triage_log "could not clear the PR lookup-error marker for $id"
+            pr_poll_observation_matches event "$id" "$out" && continue
+            ;;
+          credentials-needed|lookup-error)
+            pr_poll_observation_matches error "$id" "$out" && continue
+            ;;
+          *)
+            out=lookup-error
+            pr_poll_observation_matches error "$id" "$out" && continue
+            ;;
+        esac
+      fi
       reason="check: $c: $out"
       fm_wake_append check "$c" "$reason" || exit 1
       case "$is_pr_poll:$out" in
@@ -823,11 +850,16 @@ while :; do
           else
             triage_log "merged PR poll retirement deferred because its canonical snapshot changed for $id"
           fi
-          pr_poll_seen_clear "$id" || triage_log "could not clear the merged PR observation marker for $id"
+          pr_poll_observations_clear "$id" \
+            || triage_log "could not clear the merged PR observation markers for $id"
           ;;
-        1:closed|1:conflict|1:checks-failed)
-          pr_poll_seen_record "$id" "$out" \
+        1:closed|1:conflict|1:checks-failed|1:unresolved)
+          pr_poll_observation_record event "$id" "$out" \
             || triage_log "could not record the PR observation marker for $id"
+          ;;
+        1:credentials-needed|1:lookup-error)
+          pr_poll_observation_record error "$id" "$out" \
+            || triage_log "could not record the PR lookup-error marker for $id"
           ;;
       esac
       touch "$STATE/.last-check"
@@ -862,23 +894,20 @@ EOF
     # Triage: a signal is ACTIONABLE when any of these holds (cheapest first):
     #   - the away-mode daemon owns triage (afk) and wants every wake;
     #   - any status file carries a captain-relevant verb;
-    #   - or it is a no-verb wake (a bare turn-end, a working: note) whose crew is
-    #     NOT provably working - the crew stopped its turn with no actively-running
-    #     pipeline and no busy pane, so it may be done (even via an interactive menu
-    #     that wrote no done: status), waiting on a decision, or wedged. Absorbing
-    #     such a turn-end is exactly the swallowed-finish this change guards against.
+    #   - or any referenced task is neither an authenticated PR wait nor provably
+    #     working. Such a crew may be done, waiting on a decision, or wedged.
     # Actionable -> enqueue, advance .seen-* markers, exit. Benign (a no-verb wake
-    # whose crew IS provably working) in always-on mode -> advance the markers so it
-    # will not re-fire, log, and keep blocking without enqueuing. The provably-working
-    # check is the only costly one (it may run a bounded no-mistakes call), so the ||
-    # ordering evaluates it ONLY for a non-afk, no-captain-verb signal.
+    # whose tasks are PR waits or provably working) in always-on mode -> advance the
+    # markers so it will not re-fire, log, and keep blocking without enqueuing. The
+    # working check is the only costly one, so the || ordering evaluates it only for
+    # a non-afk, no-captain-verb signal.
     # A completed ship with an authenticated PR poll is silent before the AFK
     # one-shot handoff. Every other signal retains the existing action test.
     signal_actionable=0
     # shellcheck disable=SC2086  # $files is a space-separated status-path list (ids carry no spaces)
     if signal_crews_waiting_for_captain_merge $files; then
       signal_actionable=0
-    elif afk_present || signal_reason_is_actionable $files || ! signal_crew_provably_working $files; then
+    elif afk_present || signal_reason_is_actionable $files || ! signal_crews_safe_to_absorb $files; then
       signal_actionable=1
     fi
     if [ "$signal_actionable" -eq 1 ]; then
