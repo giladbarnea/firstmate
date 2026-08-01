@@ -430,14 +430,28 @@ test_signal_crews_safe_to_absorb_classifier() {
   seed_pr_wait "$state" ready tmux test:fm-ready "$dir/worktree"
   printf 'working: validating\n' > "$state/active.status"
   export FM_CREW_STATE_BIN="$fakebin/fm-crew-state.sh"
+  export FM_FAKE_CREW_STATE_ready='state: stopped · source: pane · endpoint gone'
   export FM_FAKE_CREW_STATE_active='state: working · source: run-step · validating (running)'
+  signal_crews_safe_to_absorb "$state/ready.status" \
+    || fail "a merge-waiting task with a stopped endpoint was not safe"
   signal_crews_safe_to_absorb "$state/ready.status" "$state/active.status" \
     || fail "a merge-waiting task and a provably-working task were not safe together"
   FM_FAKE_CREW_STATE_active='state: done · source: run-step · run passed'
   ! signal_crews_safe_to_absorb "$state/ready.status" "$state/active.status" \
     || fail "a coalesced batch with a stopped non-waiting task was treated as safe"
-  unset FM_FAKE_CREW_STATE_active
+  unset FM_FAKE_CREW_STATE_ready FM_FAKE_CREW_STATE_active
   pass "coalesced signals are safe when each task is merge-waiting or provably working"
+}
+
+test_recovery_instructions_preserve_authenticated_pr_waits() {
+  local skill="$ROOT/.agents/skills/stuck-crewmate-recovery/SKILL.md"
+  rg -F "unless AGENTS.md section 7's authenticated PR-wait state applies" "$skill" >/dev/null \
+    || fail "the recovery skill trigger omitted the authenticated PR-wait exception"
+  rg -F "stop this playbook without inspecting or recovering the finished worker endpoint" "$skill" >/dev/null \
+    || fail "the recovery skill body omitted the authenticated PR-wait stop rule"
+  rg -F "unless section 7's authenticated PR-wait state applies" "$ROOT/AGENTS.md" >/dev/null \
+    || fail "the skill catalog omitted the authenticated PR-wait exception"
+  pass "recovery instructions preserve authenticated PR waits with finished endpoints"
 }
 
 # --- benign wakes are absorbed ONLY when the crew is provably working ---------
@@ -1746,6 +1760,7 @@ test_status_is_paused_classifier
 test_crew_absorb_class_classifier
 test_signal_crew_provably_working_classifier
 test_signal_crews_safe_to_absorb_classifier
+test_recovery_instructions_preserve_authenticated_pr_waits
 test_provably_working_signal_absorbed
 test_mixed_pr_wait_and_working_signals_absorbed
 test_turn_ended_provably_working_absorbed

@@ -68,10 +68,11 @@ printf '%s\n' "$*" >> "$FM_TEST_GH_LOG"
 case " $* " in
   *" auth status "*)
     case " $* " in
-      *" --active "*) exit "${FM_TEST_GH_AUTH_RC:-0}" ;;
+      *" --active "*) exit "${FM_TEST_GH_AUTH_STATUS_ACTIVE_RC:-${FM_TEST_GH_AUTH_RC:-0}}" ;;
       *) exit "${FM_TEST_GH_INACTIVE_AUTH_RC:-${FM_TEST_GH_AUTH_RC:-0}}" ;;
     esac
     ;;
+  *" api user "*) exit "${FM_TEST_GH_AUTH_RC:-0}" ;;
   *" headRefOid "*) printf '%s\n' "${FM_TEST_GH_HEAD:-0123456789abcdef0123456789abcdef01234567}" ;;
   *"statusCheckRollup"*)
     [ "${FM_TEST_GH_FAIL:-0}" = 0 ] || exit 1
@@ -787,6 +788,8 @@ test_static_poll_contract() {
   [ "$out" = merged ] || fail "static poll did not emit exactly one merged line"
   out=$(FM_TEST_GH_FAIL=1 run_poll "$dir")
   [ "$out" = lookup-error ] || fail "static poll did not report a gh lookup failure"
+  out=$(FM_TEST_GH_AUTH_STATUS_ACTIVE_RC=2 run_poll "$dir")
+  [ "$out" = green ] || fail "static poll required the unsupported gh auth status --active flag"
   out=$(FM_TEST_GH_INACTIVE_AUTH_RC=1 run_poll "$dir")
   [ "$out" = green ] || fail "static poll treated a stale inactive GitHub account as the active account"
   out=$(FM_TEST_GH_AUTH_RC=1 run_poll "$dir")
