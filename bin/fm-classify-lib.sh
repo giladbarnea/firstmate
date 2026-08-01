@@ -37,10 +37,11 @@ FM_CLASSIFY_PR_POLL_TEMPLATE="${FM_CLASSIFY_PR_POLL_TEMPLATE:-$_FM_CLASSIFY_LIB_
 FM_CREW_STATE_BIN="${FM_CREW_STATE_BIN:-$_FM_CLASSIFY_LIB_DIR/fm-crew-state.sh}"
 
 # Captain-relevant status verbs. A status line carrying any of these is work
-# firstmate must see. Lines without these verbs are no-verb signals: the watcher
-# absorbs them only with positive provably-working evidence, while the daemon uses
-# its away-mode classification. FM_CAPTAIN_RE overrides the whole set when a home
-# needs a custom verb vocabulary; absent, this default applies.
+# firstmate must see unless its task proves the authenticated PR-wait exception.
+# Lines without these verbs are no-verb signals: the watcher absorbs them only
+# for an authenticated PR wait or with positive provably-working evidence, while
+# the daemon uses its away-mode classification. FM_CAPTAIN_RE overrides the whole
+# set when a home needs a custom verb vocabulary; absent, this default applies.
 #
 # Free-text tokens (PR ready, checks green, ready in branch, merged) exist only for
 # legacy lines that lack a standard terminal verb. status_is_captain_relevant is
@@ -328,8 +329,8 @@ window_to_task() {
 # captain-relevant last line; 1 otherwise. Pass the space-separated file list that
 # follows the "signal:" prefix. Non-.status arguments (e.g. .turn-ended markers,
 # which never carry a verb) are skipped. A 1 here is NOT "benign" on its own: a
-# no-verb signal (a bare turn-end, a working: note) is only benign when the crew is
-# also provably working (signal_crew_provably_working below); otherwise it surfaces.
+# no-verb signal (a bare turn-end, a working: note) is only benign when every task
+# is an authenticated PR wait or provably working (signal_crews_safe_to_absorb below).
 signal_reason_is_actionable() {  # <file> ...
   local f last task state
   for f in "$@"; do

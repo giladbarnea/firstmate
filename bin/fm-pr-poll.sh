@@ -4,8 +4,7 @@
 # lifecycle event, or a credential/lookup error. The provider-tagged identity is
 # data in the sidecar and is never interpolated into this source: these bytes are
 # identical for every task.
-# Each provider is read through its own standard CLI, gh for GitHub and glab
-# for GitLab, so an upstream checkout needs no extra tooling to follow either.
+# GitHub is read through gh. GitLab uses glab plus jq to classify its API JSON.
 set -u
 LC_ALL=C
 export LC_ALL

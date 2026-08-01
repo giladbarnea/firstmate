@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Record a PR-ready task: store one validated canonical pr=<url> and the forge's
-# exact pr_head=<sha> when available, then atomically arm a static merge poll.
+# exact pr_head=<sha> when available, then atomically arm a static PR state poll.
 # The watcher check source is byte-for-byte bin/fm-pr-poll.sh; task and PR data
 # live only in a private sidecar and are never interpolated into shell source.
 # A GitHub pull request URL and a GitLab merge request URL are both accepted,
@@ -47,8 +47,8 @@ fm_pr_poll_retirement_recover_one "$STATE" "$ID" "$SCRIPT_DIR/fm-pr-poll.sh" || 
   exit 1
 }
 
-# The poll is silent on every tool or API error, so GitLab arming refuses when
-# its parser or provider CLI is absent instead of creating a watch that cannot report.
+# GitLab arming refuses when its parser or provider CLI is absent, so a known
+# local dependency error is reported before the PR state poll starts.
 if [ "$PROVIDER" = gitlab ] && ! command -v jq >/dev/null 2>&1; then
   echo "error: watching a GitLab merge request requires jq on PATH" >&2
   exit 1

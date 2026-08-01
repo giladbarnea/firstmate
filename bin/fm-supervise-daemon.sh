@@ -32,10 +32,11 @@
 # /afk.
 #
 # Reliability model (see the /afk skill):
-#   - Nothing is lost in away mode: while state/.afk exists, the watcher reverts
-#     to daemon-owned one-shot behavior and enqueues every wake to
-#     state/.wake-queue BEFORE advancing its suppression markers, so a
-#     crash/restart/missed injection is recovered on the next fm-wake-drain.sh.
+#   - Nothing actionable is lost in away mode: while state/.afk exists, the
+#     watcher uses daemon-owned one-shot behavior for every wake except an
+#     authenticated PR wait. It enqueues each other wake to state/.wake-queue
+#     BEFORE advancing its suppression markers, so a crash, restart, or missed
+#     injection is recovered on the next fm-wake-drain.sh.
 #     The daemon does not touch the queue; it only reads the watcher's stdout
 #     reason.
 #   - Fail-safe-to-escalate: any wake the classifier cannot confidently mark

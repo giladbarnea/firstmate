@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Security and regression tests for canonical PR parsing, static merge polls,
+# Security and regression tests for canonical PR parsing, static PR state polls,
 # private atomic artifacts, non-executing migration, and teardown cleanup.
 set -u
 

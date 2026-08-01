@@ -10,11 +10,11 @@
 # the deliberate terminal exception: its endpoint becomes silent while the PR
 # poll remains armed. A declared external-wait pause is the separate idle absorb
 # case and re-surfaces only on its long bounded cadence.
-# While state/.afk exists, the daemon owns triage and this watcher queues and exits
-# on every wake. Printed reason lines:
-#   signal: <file>...      status/turn-end signals, surfaced when a listed status
-#                          has a captain-relevant verb OR a no-verb signal's crew
-#                          is not provably working, unless afk is active
+# While state/.afk exists, the daemon owns triage for every wake except an
+# authenticated PR wait, which stays silent before the handoff. Printed reason lines:
+#   signal: <file>...      status/turn-end signals, surfaced when any task is neither
+#                          an authenticated PR wait nor provably working, or when a
+#                          non-waiting status has a captain-relevant verb
 #   stale: <window>        a provably-working stale is ALWAYS absorbed (with a wedge
 #                          timer) regardless of what the status log says - an active
 #                          run-step or busy pane outranks even a captain-relevant log
@@ -120,19 +120,17 @@ SIGNAL_GRACE=${FM_SIGNAL_GRACE:-30}   # seconds to linger after a signal so trai
 # than wake firstmate's LLM for each, this watcher classifies every wake in bash
 # and ABSORBS the benign majority - it advances the suppression marker, logs to a
 # debug log, and keeps blocking WITHOUT enqueuing or exiting. The no-verb signal
-# / stale path is absorb-only-when-provably-working: such a wake is absorbed ONLY
-# while the crew shows positive evidence it is still working (an actively-running
-# no-mistakes step, or a busy pane, via crew_is_provably_working over
-# fm-crew-state.sh); a crew that stopped its turn with no running pipeline and no
-# busy pane is SURFACED, so a finish reported only through interactive pane menus
-# (no done: status) is never swallowed. An ACTIONABLE wake (a captain-relevant
-# signal, a no-verb signal whose crew is not provably working, any check, a stale
-# pane whose crew is not provably working, a provably-working stale past the
-# threshold, or anything unknown) is written to the durable queue and exits, which
-# is what wakes the LLM through the background-task completion. The same classifier
-# (fm-classify-lib.sh) backs the away-mode daemon; while state/.afk exists the
-# daemon owns triage, so this watcher reverts to one-shot (enqueue + exit on every
-# wake) and never double-triages - and never runs the costly provably-working read.
+# / stale path normally absorbs only positive working evidence from an active
+# no-mistakes step or a busy pane. An authenticated PR wait is the terminal
+# exception. A stopped crew with neither proof is surfaced, so an interactive
+# finish with no done status is never swallowed. An actionable wake is a
+# non-waiting captain-relevant signal, a signal whose task is neither waiting nor
+# working, a surfaced check result, a stale pane with no working evidence or
+# declared external wait, a provably-working stale past the threshold, or anything
+# unknown. It is written to the durable queue before exit. The same classifier
+# backs the away-mode daemon. While state/.afk exists, this watcher uses one-shot
+# handling for every wake except an authenticated PR wait and skips costly
+# working-state reads.
 STALE_ESCALATE_SECS=${FM_STALE_ESCALATE_SECS:-240}  # idle secs before a provably-working stale escalates as a possible wedge
 # A busy pane is unconditional proof of liveness with no built-in duration bound,
 # so a hung foreground call can remain hidden even while its rendered busy
@@ -168,9 +166,8 @@ _event_cap_ok=0
 _event_cap_fails=0
 
 # afk_present: 0 while the away-mode flag exists. When set, the daemon wraps this
-# watcher and owns triage, so the watcher must behave one-shot (enqueue + exit on
-# every wake) and let the daemon classify - never absorb here, or the daemon's
-# digest/injection layer would never see the wake.
+# watcher and owns triage, so the watcher must behave one-shot for every wake
+# except an authenticated PR wait. Other wakes must reach the daemon classifier.
 afk_present() { [ -e "$STATE/.afk" ]; }
 
 hash_pane() {
@@ -766,11 +763,11 @@ while :; do
   # No conversation scraping; unresolved records are never silently expired.
   fm_pending_reply_tick "$STATE" || true
 
-  # Slow per-task checks (firstmate writes these, e.g. a merged-PR poll).
+  # Slow per-task checks (firstmate writes these, e.g. a PR state poll).
   # Time-based via .last-check mtime so the cadence survives watcher restarts.
   # Evaluated BEFORE the signal scan: wake() exits the cycle, so a check placed
   # after the signal scan would be starved whenever a chatty sibling crewmate
-  # keeps producing signals - the slow poll (e.g. merge detection) would then
+  # keeps producing signals - the slow poll (e.g. PR state detection) would then
   # never run until the fleet went quiet. Checks are due only every
   # CHECK_INTERVAL, so most cycles skip this block and fall straight through.
   if [ "$(age_of "$STATE/.last-check")" -ge "$CHECK_INTERVAL" ]; then
@@ -892,7 +889,7 @@ $pending
 EOF
     reason="signal:$files"
     # Triage: a signal is ACTIONABLE when any of these holds (cheapest first):
-    #   - the away-mode daemon owns triage (afk) and wants every wake;
+    #   - the away-mode daemon owns triage (afk) and wants every non-waiting wake;
     #   - any status file carries a captain-relevant verb;
     #   - or any referenced task is neither an authenticated PR wait nor provably
     #     working. Such a crew may be done, waiting on a decision, or wedged.
