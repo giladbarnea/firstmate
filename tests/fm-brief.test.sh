@@ -210,6 +210,16 @@ test_ship_modes_generate_clean_briefs() {
     assert_grep "mid-task \`working:\` line (including setup complete) is nonterminal" "$brief" \
       "$id: brief missing nonterminal working:/setup-complete gate protection"
     assert_no_grep "EOF" "$brief" "$id: brief leaked a heredoc EOF marker (unterminated heredoc)"
+    case "$proj" in
+      no-registry-proj|direct-proj)
+        assert_grep "Every PR description must remain specific while using simple English and rich Markdown structure to make it highly legible and visually pleasant." "$brief" \
+          "$id: PR delivery brief omitted the readable-description requirement"
+        ;;
+      local-proj)
+        assert_no_grep "Every PR description must remain specific" "$brief" \
+          "$id: local-only brief included an irrelevant PR-description requirement"
+        ;;
+    esac
   done
   pass "fm-brief.sh: no-mistakes/direct-PR/local-only briefs generate cleanly"
 }
