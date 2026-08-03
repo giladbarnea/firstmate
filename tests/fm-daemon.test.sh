@@ -12,6 +12,7 @@ set -u
 
 DAEMON="$ROOT/bin/fm-supervise-daemon.sh"
 AFK_START="$ROOT/bin/fm-afk-start.sh"
+POLL="$ROOT/bin/fm-pr-poll.sh"
 # Source the daemon's pure functions once. Its main loop is skipped under sourcing
 # via a BASH_SOURCE guard, so only classify_*/housekeeping/escalate_*/afk_* and the
 # pane/submit helpers become defined.
@@ -24,6 +25,29 @@ fi
 TMP_ROOT=$(fm_test_tmproot fm-daemon-tests)
 FM_DAEMON_PRIMARY_HARNESS=claude
 export FM_DAEMON_PRIMARY_HARNESS
+
+seed_daemon_pr_wait() {  # <state-dir> <id> <backend> <window> <worktree>
+  local state=$1 id=$2 backend=$3 window=$4 worktree=$5 url
+  url=https://github.com/o/r/pull/42
+  mkdir -p "$worktree"
+  fm_write_meta "$state/$id.meta" \
+    "window=$window" \
+    "endpoint_task_id=$id" \
+    "worktree=$worktree" \
+    "project=fixture" \
+    "kind=ship" \
+    "mode=no-mistakes" \
+    "yolo=off" \
+    "harness=pi" \
+    "backend=$backend" \
+    "pr=$url"
+  fm_pr_url_parse "$url" || fail "daemon PR-wait fixture URL was invalid"
+  fm_pr_poll_prepare "$state" "$id" "$FM_PR_PROVIDER" "$FM_PR_URL" "$FM_PR_HOST" \
+    "$FM_PR_PATH" "$FM_PR_NUMBER" "$POLL" \
+    || fail "could not prepare the daemon PR-wait fixture"
+  fm_pr_poll_publish_prepared || fail "could not publish the daemon PR-wait fixture"
+  printf 'done: PR %s checks green\n' "$url" > "$state/$id.status"
+}
 
 test_afk_start_refuses_when_flag_cannot_be_written() {
   local dir state out status
@@ -114,6 +138,50 @@ test_classify_terminal_signal_escalates() {
     case "$out" in escalate\|*) ;; *) fail "captain verb did not escalate ($kw): $out" ;; esac
   done
   pass "captain-relevant status verbs escalate"
+}
+
+# Away mode consumes the same authenticated PR-wait predicate as normal mode.
+# It must self-handle finished signals and stale endpoints, clear inherited
+# timers without reading any backend, and keep real later blockers actionable.
+test_pr_wait_is_silent_in_daemon_classification_and_housekeeping() {
+  local dir state win key watcher_key out
+  dir=$(make_supercase daemon-pr-wait); state="$dir/state"; win="sess:fm-ready"
+  seed_daemon_pr_wait "$state" ready tmux "$win" "$dir/worktree"
+  key=$(_stale_key ready)
+  watcher_key=$(_stale_key "$win")
+
+  out=$(FM_STATE_OVERRIDE="$state" classify_signal "$state/ready.status" "$state")
+  case "$out" in self\|*) ;; *) fail "away mode escalated a finished PR-ready signal: $out" ;; esac
+  out=$(FM_STATE_OVERRIDE="$state" classify_stale "$win" "$state")
+  case "$out" in silent\|*) ;; *) fail "away mode did not classify a finished PR endpoint as silent: $out" ;; esac
+
+  : > "$state/.subsuper-stale-$key"
+  : > "$state/.subsuper-paused-$key"
+  : > "$state/.stale-$watcher_key"
+  : > "$state/.stale-since-$watcher_key"
+  : > "$state/.wedge-escalations-$watcher_key"
+  FM_STATE_OVERRIDE="$state" handle_wake "stale: $win" "$state"
+  [ ! -e "$state/.subsuper-stale-$key" ] || fail "silent PR wait retained daemon stale tracking"
+  [ ! -e "$state/.subsuper-paused-$key" ] || fail "silent PR wait retained daemon pause tracking"
+  [ ! -e "$state/.stale-since-$watcher_key" ] || fail "silent PR wait retained watcher stale tracking"
+  [ ! -s "$state/.subsuper-escalations" ] || fail "silent PR wait entered the away escalation buffer"
+
+  printf '%s\n' $(( $(date +%s) - 500 )) > "$state/.subsuper-stale-$key"
+  : > "$state/.stale-since-$watcher_key"
+  : > "$state/.wedge-escalations-$watcher_key"
+  (
+    fm_backend_capture() { fail "PR-wait housekeeping reached backend capture"; }
+    FM_STATE_OVERRIDE="$state" FM_STALE_ESCALATE_SECS=1 FM_HEARTBEAT_SCAN_SECS=0 \
+      housekeeping "$state"
+  ) || fail "silent PR-wait housekeeping failed"
+  [ ! -e "$state/.subsuper-stale-$key" ] || fail "housekeeping retained the PR-wait stale marker"
+  [ ! -e "$state/.stale-since-$watcher_key" ] || fail "housekeeping retained the PR-wait watcher timer"
+  [ ! -s "$state/.subsuper-escalations" ] || fail "housekeeping or heartbeat escalated an unchanged PR wait"
+
+  printf 'blocked: merge check lost its credential\n' > "$state/ready.status"
+  out=$(FM_STATE_OVERRIDE="$state" classify_signal "$state/ready.status" "$state")
+  case "$out" in escalate\|*) ;; *) fail "a concrete blocker stayed hidden behind PR-wait state: $out" ;; esac
+  pass "away-mode signal, stale, housekeeping, and heartbeat paths stay silent only for an authenticated PR wait"
 }
 
 test_classify_check_and_unknown_escalate() {
@@ -1833,6 +1901,7 @@ test_afk_start_reclaims_stale_daemon_lock_reused_pid
 test_daemon_state_root_uses_fm_home
 test_classify_routine_signal_self
 test_classify_terminal_signal_escalates
+test_pr_wait_is_silent_in_daemon_classification_and_housekeeping
 test_classify_check_and_unknown_escalate
 test_stale_transient_self_records_marker
 test_stale_diagnostic_wedge_survives_busy_housekeeping

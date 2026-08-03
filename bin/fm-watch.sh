@@ -6,14 +6,15 @@
 # is absorbed only when the crew shows POSITIVE evidence it is still working (an
 # actively-running no-mistakes step, or a backend busy signal), and surfaced
 # otherwise, so a crew that finishes (or stops and waits) without a current
-# working signal is never silently swallowed. A declared external-wait pause is
-# the separate idle absorb case and re-surfaces only on its long bounded cadence,
-# although its initial no-verb status signal still surfaces in normal mode.
-# While state/.afk exists, the daemon owns triage and this watcher queues and exits
-# on every wake. Printed reason lines:
-#   signal: <file>...      status/turn-end signals, surfaced when a listed status
-#                          has a captain-relevant verb OR a no-verb signal's crew
-#                          is not provably working, unless afk is active
+# working signal is never silently swallowed. An authenticated PR-ready ship is
+# the deliberate terminal exception: its endpoint becomes silent while the PR
+# poll remains armed. A declared external-wait pause is the separate idle absorb
+# case and re-surfaces only on its long bounded cadence.
+# While state/.afk exists, the daemon owns triage for every wake except an
+# authenticated PR wait, which stays silent before the handoff. Printed reason lines:
+#   signal: <file>...      status/turn-end signals, surfaced when any task is neither
+#                          an authenticated PR wait nor provably working, or when a
+#                          non-waiting status has a captain-relevant verb
 #   stale: <window>        a provably-working stale is ALWAYS absorbed (with a wedge
 #                          timer) regardless of what the status log says - an active
 #                          run-step or busy pane outranks even a captain-relevant log
@@ -119,19 +120,17 @@ SIGNAL_GRACE=${FM_SIGNAL_GRACE:-30}   # seconds to linger after a signal so trai
 # than wake firstmate's LLM for each, this watcher classifies every wake in bash
 # and ABSORBS the benign majority - it advances the suppression marker, logs to a
 # debug log, and keeps blocking WITHOUT enqueuing or exiting. The no-verb signal
-# / stale path is absorb-only-when-provably-working: such a wake is absorbed ONLY
-# while the crew shows positive evidence it is still working (an actively-running
-# no-mistakes step, or a busy pane, via crew_is_provably_working over
-# fm-crew-state.sh); a crew that stopped its turn with no running pipeline and no
-# busy pane is SURFACED, so a finish reported only through interactive pane menus
-# (no done: status) is never swallowed. An ACTIONABLE wake (a captain-relevant
-# signal, a no-verb signal whose crew is not provably working, any check, a stale
-# pane whose crew is not provably working, a provably-working stale past the
-# threshold, or anything unknown) is written to the durable queue and exits, which
-# is what wakes the LLM through the background-task completion. The same classifier
-# (fm-classify-lib.sh) backs the away-mode daemon; while state/.afk exists the
-# daemon owns triage, so this watcher reverts to one-shot (enqueue + exit on every
-# wake) and never double-triages - and never runs the costly provably-working read.
+# / stale path normally absorbs only positive working evidence from an active
+# no-mistakes step or a busy pane. An authenticated PR wait is the terminal
+# exception. A stopped crew with neither proof is surfaced, so an interactive
+# finish with no done status is never swallowed. An actionable wake is a
+# non-waiting captain-relevant signal, a signal whose task is neither waiting nor
+# working, a surfaced check result, a stale pane with no working evidence or
+# declared external wait, a provably-working stale past the threshold, or anything
+# unknown. It is written to the durable queue before exit. The same classifier
+# backs the away-mode daemon. While state/.afk exists, this watcher uses one-shot
+# handling for every wake except an authenticated PR wait and skips costly
+# working-state reads.
 STALE_ESCALATE_SECS=${FM_STALE_ESCALATE_SECS:-240}  # idle secs before a provably-working stale escalates as a possible wedge
 # A busy pane is unconditional proof of liveness with no built-in duration bound,
 # so a hung foreground call can remain hidden even while its rendered busy
@@ -167,9 +166,8 @@ _event_cap_ok=0
 _event_cap_fails=0
 
 # afk_present: 0 while the away-mode flag exists. When set, the daemon wraps this
-# watcher and owns triage, so the watcher must behave one-shot (enqueue + exit on
-# every wake) and let the daemon classify - never absorb here, or the daemon's
-# digest/injection layer would never see the wake.
+# watcher and owns triage, so the watcher must behave one-shot for every wake
+# except an authenticated PR wait. Other wakes must reach the daemon classifier.
 afk_present() { [ -e "$STATE/.afk" ]; }
 
 hash_pane() {
@@ -454,6 +452,44 @@ scan_signals() {
   return 0
 }
 
+pr_poll_observation_path() {  # <event|error> <task-id>
+  case "$1" in
+    event) printf '%s/.pr-poll-seen-%s' "$STATE" "$2" ;;
+    error) printf '%s/.pr-poll-error-seen-%s' "$STATE" "$2" ;;
+  esac
+}
+
+pr_poll_observation_matches() {  # <event|error> <task-id> <result>
+  local kind=$1 id=$2 result=$3 path
+  path=$(pr_poll_observation_path "$kind" "$id")
+  [ -f "$path" ] && [ ! -L "$path" ] || return 1
+  [ "$(fm_pr_file_link_count "$path")" = 1 ] || return 1
+  [ "$(cat "$path" 2>/dev/null || true)" = "${FM_PR_POLL_SNAPSHOT_URL}"$'\t'"$result" ]
+}
+
+pr_poll_observation_record() {  # <event|error> <task-id> <result>
+  local kind=$1 id=$2 result=$3 path tmp
+  path=$(pr_poll_observation_path "$kind" "$id")
+  [ ! -d "$path" ] || return 1
+  tmp=$(mktemp "$STATE/.fm-pr-poll-observation.XXXXXX") || return 1
+  if ! printf '%s\t%s\n' "$FM_PR_POLL_SNAPSHOT_URL" "$result" > "$tmp" \
+    || ! chmod 0600 "$tmp" \
+    || ! mv -f -- "$tmp" "$path"; then
+    rm -f -- "$tmp"
+    return 1
+  fi
+  [ -f "$path" ] && [ ! -L "$path" ] && [ "$(fm_pr_file_link_count "$path")" = 1 ]
+}
+
+pr_poll_observation_clear() { rm -f -- "$(pr_poll_observation_path "$1" "$2")"; }
+
+pr_poll_observations_clear() {
+  local id=$1 result=0
+  pr_poll_observation_clear event "$id" || result=1
+  pr_poll_observation_clear error "$id" || result=1
+  return "$result"
+}
+
 run_check_process() {
   local c=$1
   shift
@@ -727,11 +763,11 @@ while :; do
   # No conversation scraping; unresolved records are never silently expired.
   fm_pending_reply_tick "$STATE" || true
 
-  # Slow per-task checks (firstmate writes these, e.g. a merged-PR poll).
+  # Slow per-task checks (firstmate writes these, e.g. a PR state poll).
   # Time-based via .last-check mtime so the cadence survives watcher restarts.
   # Evaluated BEFORE the signal scan: wake() exits the cycle, so a check placed
   # after the signal scan would be starved whenever a chatty sibling crewmate
-  # keeps producing signals - the slow poll (e.g. merge detection) would then
+  # keeps producing signals - the slow poll (e.g. PR state detection) would then
   # never run until the fleet went quiet. Checks are due only every
   # CHECK_INTERVAL, so most cycles skip this block and fall straight through.
   if [ "$(age_of "$STATE/.last-check")" -ge "$CHECK_INTERVAL" ]; then
@@ -771,20 +807,60 @@ while :; do
           continue
         fi
       fi
-      if [ -n "$out" ]; then
-        reason="check: $c: $out"
-        fm_wake_append check "$c" "$reason" || exit 1
-        if [ "$is_pr_poll" -eq 1 ] && [ "$out" = merged ]; then
+      if [ "$is_pr_poll" -eq 0 ] && [ -z "$out" ]; then
+        continue
+      fi
+      if [ "$is_pr_poll" -eq 1 ] \
+        && ! fm_pr_poll_snapshot_matches "$STATE" "$id" "$SCRIPT_DIR/fm-pr-poll.sh"; then
+        triage_log "ignored a PR result whose authenticated snapshot changed for $id"
+        continue
+      fi
+      if [ "$is_pr_poll" -eq 1 ]; then
+        case "$out" in
+          green)
+            pr_poll_observations_clear "$id" \
+              || triage_log "could not clear the green PR observation markers for $id"
+            continue
+            ;;
+          merged) ;;
+          closed|conflict|checks-failed|unresolved)
+            pr_poll_observation_clear error "$id" \
+              || triage_log "could not clear the PR lookup-error marker for $id"
+            pr_poll_observation_matches event "$id" "$out" && continue
+            ;;
+          credentials-needed|lookup-error)
+            pr_poll_observation_matches error "$id" "$out" && continue
+            ;;
+          *)
+            out=lookup-error
+            pr_poll_observation_matches error "$id" "$out" && continue
+            ;;
+        esac
+      fi
+      reason="check: $c: $out"
+      fm_wake_append check "$c" "$reason" || exit 1
+      case "$is_pr_poll:$out" in
+        1:merged)
           if fm_pr_poll_retirement_publish "$STATE" "$id" "$SCRIPT_DIR/fm-pr-poll.sh" "$out"; then
             fm_pr_poll_retirement_recover_one "$STATE" "$id" "$SCRIPT_DIR/fm-pr-poll.sh" \
               || triage_log "merged PR poll retirement remains recoverable for $id"
           else
             triage_log "merged PR poll retirement deferred because its canonical snapshot changed for $id"
           fi
-        fi
-        touch "$STATE/.last-check"
-        wake "$reason"
-      fi
+          pr_poll_observations_clear "$id" \
+            || triage_log "could not clear the merged PR observation markers for $id"
+          ;;
+        1:closed|1:conflict|1:checks-failed|1:unresolved)
+          pr_poll_observation_record event "$id" "$out" \
+            || triage_log "could not record the PR observation marker for $id"
+          ;;
+        1:credentials-needed|1:lookup-error)
+          pr_poll_observation_record error "$id" "$out" \
+            || triage_log "could not record the PR lookup-error marker for $id"
+          ;;
+      esac
+      touch "$STATE/.last-check"
+      wake "$reason"
     done
     if [ -n "$rejected_checks" ]; then
       reason="check: rejected unauthenticated state checks:$rejected_checks"
@@ -813,20 +889,25 @@ $pending
 EOF
     reason="signal:$files"
     # Triage: a signal is ACTIONABLE when any of these holds (cheapest first):
-    #   - the away-mode daemon owns triage (afk) and wants every wake;
+    #   - the away-mode daemon owns triage (afk) and wants every non-waiting wake;
     #   - any status file carries a captain-relevant verb;
-    #   - or it is a no-verb wake (a bare turn-end, a working: note) whose crew is
-    #     NOT provably working - the crew stopped its turn with no actively-running
-    #     pipeline and no busy pane, so it may be done (even via an interactive menu
-    #     that wrote no done: status), waiting on a decision, or wedged. Absorbing
-    #     such a turn-end is exactly the swallowed-finish this change guards against.
+    #   - or any referenced task is neither an authenticated PR wait nor provably
+    #     working. Such a crew may be done, waiting on a decision, or wedged.
     # Actionable -> enqueue, advance .seen-* markers, exit. Benign (a no-verb wake
-    # whose crew IS provably working) in always-on mode -> advance the markers so it
-    # will not re-fire, log, and keep blocking without enqueuing. The provably-working
-    # check is the only costly one (it may run a bounded no-mistakes call), so the ||
-    # ordering evaluates it ONLY for a non-afk, no-captain-verb signal.
+    # whose tasks are PR waits or provably working) in always-on mode -> advance the
+    # markers so it will not re-fire, log, and keep blocking without enqueuing. The
+    # working check is the only costly one, so the || ordering evaluates it only for
+    # a non-afk, no-captain-verb signal.
+    # A completed ship with an authenticated PR poll is silent before the AFK
+    # one-shot handoff. Every other signal retains the existing action test.
+    signal_actionable=0
     # shellcheck disable=SC2086  # $files is a space-separated status-path list (ids carry no spaces)
-    if afk_present || signal_reason_is_actionable $files || ! signal_crew_provably_working $files; then
+    if signal_crews_waiting_for_captain_merge $files; then
+      signal_actionable=0
+    elif afk_present || signal_reason_is_actionable $files || ! signal_crews_safe_to_absorb $files; then
+      signal_actionable=1
+    fi
+    if [ "$signal_actionable" -eq 1 ]; then
       while IFS=$(printf '\t') read -r sf sig f; do
         [ -n "$sf" ] || continue
         fm_wake_append signal "$(basename "$f")" "$reason" || exit 1
@@ -865,6 +946,10 @@ EOF
     last=$(last_status_line "$STATE/$task.status")
     if ! status_is_paused_or_captain_held "$last" && [ -e "$STATE/.paused-$key" ]; then
       clear_pause_tracking "$w"
+    fi
+    if task_is_waiting_for_captain_merge "$STATE" "$task"; then
+      clear_pause_tracking "$w"
+      continue
     fi
     if [ "$kind" = secondmate ] && ! status_is_paused "$last"; then
       continue

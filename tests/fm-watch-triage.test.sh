@@ -21,9 +21,12 @@ set -u
 . "$(dirname "${BASH_SOURCE[0]}")/wake-helpers.sh"
 # shellcheck source=/dev/null
 . "$ROOT/bin/fm-classify-lib.sh"
+# shellcheck source=/dev/null
+. "$ROOT/bin/fm-pr-lib.sh"
 
 WATCH="$ROOT/bin/fm-watch.sh"
 DRAIN="$ROOT/bin/fm-wake-drain.sh"
+POLL="$ROOT/bin/fm-pr-poll.sh"
 
 TMP_ROOT=$(fm_test_tmproot fm-watch-triage-tests)
 
@@ -109,6 +112,31 @@ record_pi_busy() {  # <state-dir> <id>
     --source pi-ext --event agent-start
 }
 
+seed_pr_wait() {  # <state-dir> <id> <backend> <window> <worktree>
+  local state=$1 id=$2 backend=$3 window=$4 worktree=$5 url
+  url="https://github.com/o/r/pull/42"
+  mkdir -p "$worktree"
+  printf 'isolated copy sentinel\n' > "$worktree/sentinel"
+  fm_write_meta "$state/$id.meta" \
+    "window=$window" \
+    "endpoint_task_id=$id" \
+    "worktree=$worktree" \
+    "project=fixture" \
+    "kind=ship" \
+    "mode=no-mistakes" \
+    "yolo=off" \
+    "harness=pi" \
+    "backend=$backend" \
+    "pr=$url"
+  fm_pr_url_parse "$url" || fail "PR-wait fixture URL was invalid"
+  fm_pr_poll_prepare "$state" "$id" "$FM_PR_PROVIDER" "$FM_PR_URL" "$FM_PR_HOST" \
+    "$FM_PR_PATH" "$FM_PR_NUMBER" "$POLL" \
+    || fail "could not prepare the PR-wait fixture"
+  fm_pr_poll_publish_prepared || fail "could not publish the PR-wait fixture"
+  printf 'done: PR %s checks green\n' "$url" > "$state/$id.status"
+  touch "$state/.last-check"
+}
+
 reap() { kill "$1" 2>/dev/null || true; wait "$1" 2>/dev/null || true; }
 
 # --- pure classifier predicates (fm-classify-lib.sh) ------------------------
@@ -152,6 +180,71 @@ test_scan_captain_relevant_statuses_classifier() {
   printf '%s' "$out" | grep -F "three.status" >/dev/null || fail "scan missed a done: status"
   printf '%s' "$out" | grep -F "one.status" >/dev/null && fail "scan surfaced a benign working: status"
   pass "scan_captain_relevant_statuses lists only captain-relevant statuses"
+}
+
+# A finished ship becomes a silent PR wait only through the complete lifecycle
+# proof: latest done event, no open decision or PR event, ship kind, yolo off,
+# and the current authenticated PR poll. The predicate is above backend dispatch, so
+# every supported backend gets the same result without a backend-specific branch.
+test_pr_wait_classifier_is_authenticated_and_backend_neutral() {
+  local dir state id backend window
+  local -a meta_lines
+  dir=$(make_case pr-wait-classifier); state="$dir/state"; id=ready
+  seed_pr_wait "$state" "$id" tmux "test:fm-$id" "$dir/worktree"
+
+  while IFS='|' read -r backend window; do
+    [ -n "$backend" ] || continue
+    meta_lines=(
+      "window=$window"
+      "endpoint_task_id=$id"
+      "worktree=$dir/worktree"
+      "project=fixture"
+      "kind=ship"
+      "mode=no-mistakes"
+      "yolo=off"
+      "harness=pi"
+      "backend=$backend"
+    )
+    [ "$backend" != orca ] || meta_lines+=("terminal=$window")
+    meta_lines+=("pr=https://github.com/o/r/pull/42")
+    fm_write_meta "$state/$id.meta" "${meta_lines[@]}"
+    task_is_waiting_for_captain_merge "$state" "$id" \
+      || fail "authenticated PR wait was not recognized for backend=$backend"
+  done <<'EOF'
+tmux|test:fm-ready
+herdr|default:w1:p2
+zellij|firstmate:42
+orca|term-ready
+cmux|workspace-ready:surface-ready
+EOF
+
+  printf 'needs-decision [key=merge-note]: choose the release note\ndone: PR https://github.com/o/r/pull/42 checks green\n' \
+    > "$state/$id.status"
+  ! task_is_waiting_for_captain_merge "$state" "$id" \
+    || fail "an open captain decision was hidden by a later done event"
+  printf 'resolved [key=merge-note]: use the short note\ndone: PR https://github.com/o/r/pull/42 checks green\n' \
+    >> "$state/$id.status"
+  task_is_waiting_for_captain_merge "$state" "$id" \
+    || fail "a resolved decision prevented an authenticated PR wait"
+
+  for backend in blocked failed needs-decision; do
+    printf '%s: concrete task event\n' "$backend" > "$state/$id.status"
+    ! task_is_waiting_for_captain_merge "$state" "$id" \
+      || fail "$backend status was hidden by the PR-wait classifier"
+  done
+  printf 'done: PR https://github.com/o/r/pull/42 checks green\n' > "$state/$id.status"
+  printf 'yolo=on\n' >> "$state/$id.meta"
+  ! task_is_waiting_for_captain_merge "$state" "$id" \
+    || fail "standing merge authority was mistaken for a captain-only PR wait"
+  printf 'yolo=off\n' >> "$state/$id.meta"
+  printf 'https://github.com/o/r/pull/42\tconflict\n' > "$state/.pr-poll-seen-$id"
+  ! task_is_waiting_for_captain_merge "$state" "$id" \
+    || fail "an unresolved PR event was mistaken for a captain-only wait"
+  rm -f "$state/.pr-poll-seen-$id"
+  printf '# tampered\n' >> "$state/$id.check.sh"
+  ! task_is_waiting_for_captain_merge "$state" "$id" \
+    || fail "a task with a tampered PR poll remained silently exempt"
+  pass "authenticated PR-wait classification is backend-neutral and yields to decisions, blockers, failures, and poll corruption"
 }
 
 test_classifier_primitives() {
@@ -331,6 +424,36 @@ test_signal_crew_provably_working_classifier() {
   pass "signal_crew_provably_working: benign only when every referenced crew is provably working"
 }
 
+test_signal_crews_safe_to_absorb_classifier() {
+  local dir fakebin state
+  dir=$(make_case signal-safe-to-absorb); fakebin="$dir/fakebin"; state="$dir/state"
+  seed_pr_wait "$state" ready tmux test:fm-ready "$dir/worktree"
+  printf 'working: validating\n' > "$state/active.status"
+  export FM_CREW_STATE_BIN="$fakebin/fm-crew-state.sh"
+  export FM_FAKE_CREW_STATE_ready='state: stopped · source: pane · endpoint gone'
+  export FM_FAKE_CREW_STATE_active='state: working · source: run-step · validating (running)'
+  signal_crews_safe_to_absorb "$state/ready.status" \
+    || fail "a merge-waiting task with a stopped endpoint was not safe"
+  signal_crews_safe_to_absorb "$state/ready.status" "$state/active.status" \
+    || fail "a merge-waiting task and a provably-working task were not safe together"
+  FM_FAKE_CREW_STATE_active='state: done · source: run-step · run passed'
+  ! signal_crews_safe_to_absorb "$state/ready.status" "$state/active.status" \
+    || fail "a coalesced batch with a stopped non-waiting task was treated as safe"
+  unset FM_FAKE_CREW_STATE_ready FM_FAKE_CREW_STATE_active
+  pass "coalesced signals are safe when each task is merge-waiting or provably working"
+}
+
+test_recovery_instructions_preserve_authenticated_pr_waits() {
+  local skill="$ROOT/.agents/skills/stuck-crewmate-recovery/SKILL.md"
+  grep -F "unless AGENTS.md section 7's authenticated PR-wait state applies" "$skill" >/dev/null \
+    || fail "the recovery skill trigger omitted the authenticated PR-wait exception"
+  grep -F "stop this playbook without inspecting or recovering the finished worker endpoint" "$skill" >/dev/null \
+    || fail "the recovery skill body omitted the authenticated PR-wait stop rule"
+  grep -F "unless section 7's authenticated PR-wait state applies" "$ROOT/AGENTS.md" >/dev/null \
+    || fail "the skill catalog omitted the authenticated PR-wait exception"
+  pass "recovery instructions preserve authenticated PR waits with finished endpoints"
+}
+
 # --- benign wakes are absorbed ONLY when the crew is provably working ---------
 
 test_provably_working_signal_absorbed() {
@@ -353,6 +476,26 @@ test_provably_working_signal_absorbed() {
   [ -e "$state/.last-watcher-beat" ] || fail "watcher beacon was not touched while absorbing"
   reap "$pid"
   pass "a no-verb signal whose crew is provably working is absorbed (no exit, no queue, suppressor advanced, beacon present)"
+}
+
+test_mixed_pr_wait_and_working_signals_absorbed() {
+  local dir state fakebin out pid
+  dir=$(make_case mixed-pr-wait-working); state="$dir/state"; fakebin="$dir/fakebin"; out="$dir/watch.out"
+  seed_pr_wait "$state" ready tmux test:fm-ready "$dir/worktree"
+  printf 'working: validating\n' > "$state/active.status"
+  export FM_FAKE_CREW_STATE_active='state: working · source: run-step · validating (running)'
+  watch_bg "$state" "$fakebin" "$out"
+  pid=$!
+  if ! wait_live "$pid" 30; then
+    reap "$pid"; fail "mixed merge-waiting and working signals woke supervision: $(cat "$out")"
+  fi
+  [ ! -s "$out" ] || fail "mixed safe signals printed a wake reason: $(cat "$out")"
+  [ ! -s "$state/.wake-queue" ] || fail "mixed safe signals enqueued a durable wake record"
+  [ -s "$state/.seen-ready_status" ] || fail "merge-waiting signal suppressor was not advanced"
+  [ -s "$state/.seen-active_status" ] || fail "working signal suppressor was not advanced"
+  reap "$pid"
+  unset FM_FAKE_CREW_STATE_active
+  pass "coalesced merge-waiting and working signals are absorbed together"
 }
 
 test_turn_ended_provably_working_absorbed() {
@@ -1210,6 +1353,61 @@ test_busy_pane_changing_hash_escalates_past_turn_age_bound() {
   pass "a busy worker whose pane hash changes every poll still escalates once its completed-turn age reaches the bound"
 }
 
+# Incident regression: once a finished ship has an authenticated PR poll, its
+# endpoint is no longer work to supervise. A final status signal, an over-age Pi
+# busy footer, stale timers, and the heartbeat backstop must all stay silent while
+# the branch, isolated copy, metadata, and poll artifacts remain intact.
+test_pr_wait_silences_signal_stale_busy_age_and_heartbeat() {
+  local dir state fakebin out capture_file window key pid before after suffix
+  dir=$(make_case pr-wait-silence); state="$dir/state"; fakebin="$dir/fakebin"
+  out="$dir/watch.out"; capture_file="$dir/pane.txt"; window="test:fm-ready"
+  seed_pr_wait "$state" ready tmux "$window" "$dir/worktree"
+  printf 'Working... (3600.1s)' > "$capture_file"
+  touch "$state/ready.turn-ended"
+  record_pi_busy "$state" ready
+
+  PATH="$fakebin:$PATH" FM_FAKE_TMUX_WINDOW="$window" FM_FAKE_TMUX_CAPTURE="$capture_file" \
+    FM_STATE_OVERRIDE="$state" FM_CREW_STATE_BIN="$fakebin/fm-crew-state.sh" FM_POLL=1 FM_SIGNAL_GRACE=0 \
+    FM_CHECK_INTERVAL=999999 FM_HEARTBEAT=999999 "$WATCH" > "$out" &
+  pid=$!
+  if ! wait_live "$pid" 30; then
+    reap "$pid"; fail "the PR-ready done signal woke supervision: $(cat "$out")"
+  fi
+  [ ! -s "$out" ] || { reap "$pid"; fail "the PR-ready signal printed a wake: $(cat "$out")"; }
+  [ ! -s "$state/.wake-queue" ] || { reap "$pid"; fail "the PR-ready signal queued a wake"; }
+  reap "$pid"
+
+  set_mtime $(( $(date +%s) - 500 )) "$state/ready.turn-ended"
+  prime_turnend_seen "$state/ready.turn-ended"
+  key=$(printf '%s' "$window" | tr ':/.' '___')
+  printf '%s\n' $(( $(date +%s) - 500 )) > "$state/.stale-since-$key"
+  printf '4\n' > "$state/.wedge-escalations-$key"
+  before=$(for suffix in meta check.sh pr-poll pr-poll-registration; do shasum -a 256 "$state/ready.$suffix"; done)
+  rm -f "$state/.last-heartbeat"
+  : > "$out"
+  printf 'Working... (3601.2s)' > "$capture_file"
+  PATH="$fakebin:$PATH" FM_FAKE_TMUX_WINDOW="$window" FM_FAKE_TMUX_CAPTURE="$capture_file" \
+    FM_STATE_OVERRIDE="$state" FM_CREW_STATE_BIN="$fakebin/fm-crew-state.sh" FM_BUSY_TURN_MAX_SECS=1 \
+    FM_STALE_ESCALATE_SECS=1 FM_POLL=1 FM_SIGNAL_GRACE=0 FM_CHECK_INTERVAL=999999 FM_HEARTBEAT=1 \
+    "$WATCH" > "$out" &
+  pid=$!
+  if ! wait_live "$pid" 30; then
+    reap "$pid"; fail "the PR wait emitted a stale, elapsed-time, or heartbeat wake: $(cat "$out")"
+  fi
+  [ ! -s "$out" ] || { reap "$pid"; fail "the PR wait printed a wake: $(cat "$out")"; }
+  [ ! -s "$state/.wake-queue" ] || { reap "$pid"; fail "the PR wait queued a wake"; }
+  [ ! -e "$state/.stale-since-$key" ] || { reap "$pid"; fail "the PR wait retained its stale timer"; }
+  [ ! -e "$state/.wedge-escalations-$key" ] || { reap "$pid"; fail "the PR wait retained its wedge counter"; }
+  [ "$(cat "$state/.heartbeat-streak" 2>/dev/null || echo 0)" -ge 1 ] \
+    || { reap "$pid"; fail "the silent PR wait did not absorb a no-change heartbeat"; }
+  after=$(for suffix in meta check.sh pr-poll pr-poll-registration; do shasum -a 256 "$state/ready.$suffix"; done)
+  [ "$after" = "$before" ] || { reap "$pid"; fail "silent PR supervision changed task metadata or poll artifacts"; }
+  [ "$(cat "$dir/worktree/sentinel")" = 'isolated copy sentinel' ] \
+    || { reap "$pid"; fail "silent PR supervision changed the isolated copy"; }
+  reap "$pid"
+  pass "an authenticated PR wait absorbs signal, stale, busy-age, heartbeat, and no-change churn without touching unlanded work"
+}
+
 test_busy_pane_turn_end_touch_resets_age() {
   local dir state fakebin out capture_file window key pane_hash sig pid
   dir=$(make_case busy-turn-end-resets-age); state="$dir/state"; fakebin="$dir/fakebin"
@@ -1555,12 +1753,16 @@ test_afk_paused_changed_pane_hands_off_plain_stale() {
 test_signal_reason_is_actionable_classifier
 test_stale_is_terminal_classifier
 test_scan_captain_relevant_statuses_classifier
+test_pr_wait_classifier_is_authenticated_and_backend_neutral
 test_classifier_primitives
 test_crew_is_provably_working_classifier
 test_status_is_paused_classifier
 test_crew_absorb_class_classifier
 test_signal_crew_provably_working_classifier
+test_signal_crews_safe_to_absorb_classifier
+test_recovery_instructions_preserve_authenticated_pr_waits
 test_provably_working_signal_absorbed
+test_mixed_pr_wait_and_working_signals_absorbed
 test_turn_ended_provably_working_absorbed
 test_turn_ended_not_working_surfaced
 test_working_note_not_working_surfaced
@@ -1573,6 +1775,7 @@ test_wedge_escalation_resets_when_pane_becomes_active
 test_busy_pane_below_turn_age_bound_is_absorbed
 test_busy_pane_stable_hash_escalates_past_turn_age_bound
 test_busy_pane_changing_hash_escalates_past_turn_age_bound
+test_pr_wait_silences_signal_stale_busy_age_and_heartbeat
 test_busy_pane_turn_end_touch_resets_age
 test_busy_pane_repeated_escalation_reaches_demand_deep_inspection
 test_busy_pane_default_turn_age_bound_is_3600s

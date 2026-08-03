@@ -2,7 +2,7 @@
 name: stuck-crewmate-recovery
 description: >-
   Agent-only playbook for stuck or missing ordinary Firstmate direct reports.
-  Use when the session-start digest reports an ordinary direct report's endpoint dead or its metadata has no window, or after a stale wake, looping pane, repeated confusion, an answered-by-brief question, an unresponsive crewmate, or a failed steer.
+  Use when the session-start digest reports an ordinary direct report's endpoint dead or its metadata has no window unless AGENTS.md section 7's authenticated PR-wait state applies, or after a stale wake, looping pane, repeated confusion, an answered-by-brief question, an unresponsive crewmate, or a failed steer.
   Reconciles recorded work before escalating from targeted inspection through safe relaunch or failure.
 user-invocable: false
 metadata:
@@ -11,7 +11,7 @@ metadata:
 
 # stuck-crewmate-recovery
 
-Use this playbook when the session-start digest reports an ordinary direct report's endpoint dead or its metadata has no window, or when a direct report is stale, looping, repeatedly confused, asking a question its brief already answers, unresponsive, or when a steer failed to land.
+Use this playbook when the session-start digest reports an ordinary direct report's endpoint dead or its metadata has no window unless AGENTS.md section 7's authenticated PR-wait state applies, or when a direct report is stale, looping, repeatedly confused, asking a question its brief already answers, unresponsive, or when a steer failed to land.
 
 Load `harness-adapters` before sending an interrupt, exit command, resume command, or harness-specific skill invocation.
 The target window's harness is recorded as `harness=` in `state/<id>.meta`.
@@ -20,6 +20,8 @@ The target window's harness is recorded as `harness=` in `state/<id>.meta`.
 
 This procedure covers ordinary `kind=ship` and `kind=scout` direct reports.
 Load `secondmate-provisioning` instead for `kind=secondmate` recovery.
+Before recovery, apply AGENTS.md section 7's authenticated PR-wait boundary.
+When it applies, stop this playbook without inspecting or recovering the finished worker endpoint.
 
 Treat the digest's endpoint result as a presence signal, not proof that the task's work or validation run is gone.
 Read the targeted current state with `bin/fm-crew-state.sh <id>` before deciding to relaunch.
